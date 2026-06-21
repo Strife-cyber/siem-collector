@@ -1,0 +1,16 @@
+[package]
+name = "siem-collector"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+toml = "1.1.2"
+anyhow = "1.0.102"
+tracing = "0.1.44"
+hostname = "0.4.2"
+thiserror = "2.0.18"
+directories = "6.0.0"
+tokio = { version = "1.52.3", features = ["full"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+serde = { version = "1.0.228", features = ["derive"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
