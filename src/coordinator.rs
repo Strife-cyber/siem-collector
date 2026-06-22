@@ -72,19 +72,37 @@ impl Coordinator {
         // ── 3. Spawn platform coordinators ────────────────────────────
         let mut platform_handles = Vec::new();
 
-        // Windows
-        let win_tx = tx.clone();
-        platform_handles.push(tokio::spawn(async move {
-            if let Err(e) = crate::logs::windows::coordinator::WindowsCoordinator::run(win_tx).await
-            {
-                error!("Windows coordinator failed: {:#}", e);
-            } else {
-                info!("Windows coordinator finished");
-            }
-        }));
+        // ── Windows ─────────────────────────────────────────────────────
+        #[cfg(target_os = "windows")]
+        {
+            let win_tx = tx.clone();
+            platform_handles.push(tokio::spawn(async move {
+                if let Err(e) =
+                    crate::logs::windows::coordinator::WindowsCoordinator::run(win_tx).await
+                {
+                    error!("Windows coordinator failed: {:#}", e);
+                } else {
+                    info!("Windows coordinator finished");
+                }
+            }));
+        }
+
+        // ── Linux ───────────────────────────────────────────────────────
+        #[cfg(target_os = "linux")]
+        {
+            let linux_tx = tx.clone();
+            platform_handles.push(tokio::spawn(async move {
+                if let Err(e) =
+                    crate::logs::linux::coordinator::LinuxCoordinator::run(linux_tx).await
+                {
+                    error!("Linux coordinator failed: {:#}", e);
+                } else {
+                    info!("Linux coordinator finished");
+                }
+            }));
+        }
 
         // Future platform coordinators go here:
-        //   - Linux coordinator  → tx.clone()
         //   - Firewall coordinator → tx.clone()
         //   - Web server coordinator → tx.clone()
         //   - Cisco / network device coordinator → tx.clone()

@@ -1,13 +1,19 @@
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fmt::Formatter;
-use chrono::{DateTime, Utc};
-use serde::{Serialize, Deserialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum SourceType {
-    LinuxAuth,          // /var/log/auth.log
-    WindowsSecurity,    // Windows Event Logs 4624/4625
+    LinuxAuth, // /var/log/auth.log
+    LinuxSyslog,
+    LinuxKernel,
+    LinuxAuditd,
+    LinuxSystemdJournal,
+    LinuxProcess,
+    LinuxNetwork,
+    WindowsSecurity, // Windows Event Logs 4624/4625
     WindowsSystem,
     WindowsApplication,
     WindowsFim,
@@ -17,9 +23,9 @@ pub enum SourceType {
     WindowsRegistry,
     WindowsServices,
     WindowsTasks,
-    Firewall,           // iptables / pfSense / Cisco ASA logs
-    WebServer,          // Nginx / Apache access logs
-    Custom(String)      // For the "fallback" or rare cases
+    Firewall,       // iptables / pfSense / Cisco ASA logs
+    WebServer,      // Nginx / Apache access logs
+    Custom(String), // For the "fallback" or rare cases
 }
 
 // Default for unknow
@@ -33,6 +39,12 @@ impl fmt::Display for SourceType {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             SourceType::LinuxAuth => write!(f, "LINUX_AUTH"),
+            SourceType::LinuxSyslog => write!(f, "LINUX_SYSLOG"),
+            SourceType::LinuxKernel => write!(f, "LINUX_KERNEL"),
+            SourceType::LinuxAuditd => write!(f, "LINUX_AUDITD"),
+            SourceType::LinuxSystemdJournal => write!(f, "LINUX_SYSTEMD_JOURNAL"),
+            SourceType::LinuxProcess => write!(f, "LINUX_PROCESS"),
+            SourceType::LinuxNetwork => write!(f, "LINUX_NETWORK"),
             SourceType::WindowsSecurity => write!(f, "WINDOWS_SECURITY"),
             SourceType::WindowsSystem => write!(f, "WINDOWS_SYSTEM"),
             SourceType::WindowsApplication => write!(f, "WINDOWS_APPLICATION"),
@@ -54,6 +66,12 @@ impl SourceType {
     pub fn as_str(&self) -> &str {
         match self {
             SourceType::LinuxAuth => "LINUX_AUTH",
+            SourceType::LinuxSyslog => "LINUX_SYSLOG",
+            SourceType::LinuxKernel => "LINUX_KERNEL",
+            SourceType::LinuxAuditd => "LINUX_AUDITD",
+            SourceType::LinuxSystemdJournal => "LINUX_SYSTEMD_JOURNAL",
+            SourceType::LinuxProcess => "LINUX_PROCESS",
+            SourceType::LinuxNetwork => "LINUX_NETWORK",
             SourceType::WindowsSecurity => "WINDOWS_SECURITY",
             SourceType::WindowsSystem => "WINDOWS_SYSTEM",
             SourceType::WindowsApplication => "WINDOWS_APPLICATION",

@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use tokio::sync::mpsc;
 
 pub mod windows;
+pub mod linux;
 
 #[async_trait]
 pub trait Collector: Send {
