@@ -8,3 +8,4 @@ pub mod process;
 pub mod registry;
 pub mod services;
 pub mod tasks;
+pub mod coordinator;

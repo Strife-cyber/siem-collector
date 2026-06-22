@@ -7,7 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// Prevents OOM from corrupted or malicious length headers.
 const MAX_FRAME_SIZE: usize = 10_000_000;
 
-async fn write_record(file: &mut tokio::fs::File, record: &CollectorLogRecord) -> Result<()> {
+pub async fn write_record(file: &mut tokio::fs::File, record: &CollectorLogRecord) -> Result<()> {
     let payload = to_vec(record)?;
 
     // Build and write a single frame buffer (length prefix + payload).
@@ -22,7 +22,7 @@ async fn write_record(file: &mut tokio::fs::File, record: &CollectorLogRecord) -
     Ok(())
 }
 
-async fn read_next_record(file: &mut tokio::fs::File) -> Result<Option<CollectorLogRecord>> {
+pub async fn read_next_record(file: &mut tokio::fs::File) -> Result<Option<CollectorLogRecord>> {
     let mut len_buf = [0u8; 4];
 
     if file.read_exact(&mut len_buf).await.is_err() {

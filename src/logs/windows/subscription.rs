@@ -8,11 +8,16 @@
 
 use anyhow::Result;
 use tokio::sync::mpsc::Sender;
-use tracing::{error, trace};
+use tracing::{error, trace, warn};
 
 use crate::types::{CollectorLogRecord, SourceType};
 
 use windows::Win32::Foundation::ERROR_NO_MORE_ITEMS;
+
+/// HRESULT encoding of `ERROR_NO_MORE_ITEMS` (0x80070103).
+/// `EvtNext` returns a Win32 error via `GetLastError`, but
+/// `windows::core::Error::from_win32()` surfaces it as an HRESULT.
+const ERROR_NO_MORE_ITEMS_HR: i32 = (0x80070000u32 | ERROR_NO_MORE_ITEMS.0) as i32;
 use windows::Win32::System::EventLog::{EVT_HANDLE, EvtClose, EvtNext, EvtQuery, EvtRender};
 use windows::core::PCWSTR;
 
@@ -155,11 +160,13 @@ pub(crate) fn subscribe_and_collect(
             let err_code = windows::core::Error::from_win32();
             let code = err_code.code().0;
 
-            if code == ERROR_NO_MORE_ITEMS.0 as i32 {
-                // No events right now – sleep and retry.
+            if code == ERROR_NO_MORE_ITEMS_HR {
+                // No new events — normal, poll again after a short sleep.
+                trace!("No new events on '{}', retrying…", channel);
                 std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
             } else {
-                error!(
+                // Real error — log at warn and back off.
+                warn!(
                     "EvtNext error for channel '{}': {} (code {})",
                     channel, err_code, code
                 );
