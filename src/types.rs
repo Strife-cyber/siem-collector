@@ -23,8 +23,14 @@ pub enum SourceType {
     WindowsRegistry,
     WindowsServices,
     WindowsTasks,
-    Firewall,       // iptables / pfSense / Cisco ASA logs
-    WebServer,      // Nginx / Apache access logs
+    Firewall,  // iptables / pfSense / Cisco ASA logs
+    WebServer, // Nginx / Apache access logs
+    NginxAccess,
+    NginxError,
+    ApacheAccess,
+    ApacheError,
+    Traefik,
+    DockerContainer,
     Custom(String), // For the "fallback" or rare cases
 }
 
@@ -57,6 +63,12 @@ impl fmt::Display for SourceType {
             SourceType::WindowsTasks => write!(f, "WINDOWS_TASKS"),
             SourceType::Firewall => write!(f, "FIREWALL"),
             SourceType::WebServer => write!(f, "WEB_SERVER"),
+            SourceType::NginxAccess => write!(f, "NGINX_ACCESS"),
+            SourceType::NginxError => write!(f, "NGINX_ERROR"),
+            SourceType::ApacheAccess => write!(f, "APACHE_ACCESS"),
+            SourceType::ApacheError => write!(f, "APACHE_ERROR"),
+            SourceType::Traefik => write!(f, "TRAEFIK"),
+            SourceType::DockerContainer => write!(f, "DOCKER_CONTAINER"),
             SourceType::Custom(str) => write!(f, "CUSTOM({})", str),
         }
     }
@@ -84,6 +96,12 @@ impl SourceType {
             SourceType::WindowsTasks => "WINDOWS_TASKS",
             SourceType::Firewall => "FIREWALL",
             SourceType::WebServer => "WEB_SERVER",
+            SourceType::NginxAccess => "NGINX_ACCESS",
+            SourceType::NginxError => "NGINX_ERROR",
+            SourceType::ApacheAccess => "APACHE_ACCESS",
+            SourceType::ApacheError => "APACHE_ERROR",
+            SourceType::Traefik => "TRAEFIK",
+            SourceType::DockerContainer => "DOCKER_CONTAINER",
             SourceType::Custom(str) => str.as_str(),
         }
     }

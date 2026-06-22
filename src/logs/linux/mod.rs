@@ -5,6 +5,7 @@
 //!
 //! All paths are Linux-specific and this module only compiles on `target_os = "linux"`.
 
+pub(crate) mod streamer;
 pub(crate) mod tailer;
 
 pub mod auditd;

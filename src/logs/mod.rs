@@ -2,8 +2,10 @@ use crate::types::CollectorLogRecord;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
-pub mod windows;
+pub mod firewall;
 pub mod linux;
+pub mod webserver;
+pub mod windows;
 
 #[async_trait]
 pub trait Collector: Send {

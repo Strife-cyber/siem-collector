@@ -102,9 +102,37 @@ impl Coordinator {
             }));
         }
 
+        // ── Web servers (Nginx, Apache, Traefik) ─────────────────────-
+        // Web server collectors are primarily Linux-based but the coordinator
+        // is platform-agnostic so it's always available.
+        {
+            let ws_tx = tx.clone();
+            platform_handles.push(tokio::spawn(async move {
+                if let Err(e) =
+                    crate::logs::webserver::coordinator::WebServerCoordinator::run(ws_tx).await
+                {
+                    error!("Web server coordinator failed: {:#}", e);
+                } else {
+                    info!("Web server coordinator finished");
+                }
+            }));
+        }
+
+        // ── Firewall (syslog listener on UDP 514) ──────────────────────
+        {
+            let fw_tx = tx.clone();
+            platform_handles.push(tokio::spawn(async move {
+                if let Err(e) =
+                    crate::logs::firewall::coordinator::FirewallCoordinator::run(fw_tx).await
+                {
+                    error!("Firewall coordinator failed: {:#}", e);
+                } else {
+                    info!("Firewall coordinator finished");
+                }
+            }));
+        }
+
         // Future platform coordinators go here:
-        //   - Firewall coordinator → tx.clone()
-        //   - Web server coordinator → tx.clone()
         //   - Cisco / network device coordinator → tx.clone()
         //   - etc.
 
