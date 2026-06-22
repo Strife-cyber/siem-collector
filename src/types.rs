@@ -8,6 +8,15 @@ use serde::{Serialize, Deserialize};
 pub enum SourceType {
     LinuxAuth,          // /var/log/auth.log
     WindowsSecurity,    // Windows Event Logs 4624/4625
+    WindowsSystem,
+    WindowsApplication,
+    WindowsFim,
+    WindowsInventory,
+    WindowsNetwork,
+    WindowsProcess,
+    WindowsRegistry,
+    WindowsServices,
+    WindowsTasks,
     Firewall,           // iptables / pfSense / Cisco ASA logs
     WebServer,          // Nginx / Apache access logs
     Custom(String)      // For the "fallback" or rare cases
@@ -25,6 +34,15 @@ impl fmt::Display for SourceType {
         match self {
             SourceType::LinuxAuth => write!(f, "LINUX_AUTH"),
             SourceType::WindowsSecurity => write!(f, "WINDOWS_SECURITY"),
+            SourceType::WindowsSystem => write!(f, "WINDOWS_SYSTEM"),
+            SourceType::WindowsApplication => write!(f, "WINDOWS_APPLICATION"),
+            SourceType::WindowsFim => write!(f, "WINDOWS_FIM"),
+            SourceType::WindowsInventory => write!(f, "WINDOWS_INVENTORY"),
+            SourceType::WindowsNetwork => write!(f, "WINDOWS_NETWORK"),
+            SourceType::WindowsProcess => write!(f, "WINDOWS_PROCESS"),
+            SourceType::WindowsRegistry => write!(f, "WINDOWS_REGISTRY"),
+            SourceType::WindowsServices => write!(f, "WINDOWS_SERVICES"),
+            SourceType::WindowsTasks => write!(f, "WINDOWS_TASKS"),
             SourceType::Firewall => write!(f, "FIREWALL"),
             SourceType::WebServer => write!(f, "WEB_SERVER"),
             SourceType::Custom(str) => write!(f, "CUSTOM({})", str),
@@ -37,6 +55,15 @@ impl SourceType {
         match self {
             SourceType::LinuxAuth => "LINUX_AUTH",
             SourceType::WindowsSecurity => "WINDOWS_SECURITY",
+            SourceType::WindowsSystem => "WINDOWS_SYSTEM",
+            SourceType::WindowsApplication => "WINDOWS_APPLICATION",
+            SourceType::WindowsFim => "WINDOWS_FIM",
+            SourceType::WindowsInventory => "WINDOWS_INVENTORY",
+            SourceType::WindowsNetwork => "WINDOWS_NETWORK",
+            SourceType::WindowsProcess => "WINDOWS_PROCESS",
+            SourceType::WindowsRegistry => "WINDOWS_REGISTRY",
+            SourceType::WindowsServices => "WINDOWS_SERVICES",
+            SourceType::WindowsTasks => "WINDOWS_TASKS",
             SourceType::Firewall => "FIREWALL",
             SourceType::WebServer => "WEB_SERVER",
             SourceType::Custom(str) => str.as_str(),
