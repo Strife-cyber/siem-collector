@@ -30,7 +30,7 @@ use crate::types::CollectorLogRecord;
 /// Descriptions for startup logging.
 const ALL_LISTENERS: &[(&str, &str)] = &[(
     "SyslogUDP",
-    "UDP syslog listener on port 514 (firewall logs)",
+    "UDP syslog listener on port 1514 (firewall logs; use 514 in production)",
 )];
 
 pub struct FirewallCoordinator;
@@ -41,10 +41,12 @@ impl FirewallCoordinator {
 
         let mut handles = Vec::new();
 
-        // UDP syslog listener on port 514.
+        // UDP syslog listener on port 1514 (does not require root).
+        // For production, configure your firewalls to send to port 514
+        // and change to `SyslogListener::new()`.
         let tx = sender.clone();
         handles.push(tokio::spawn(async move {
-            let listener = SyslogListener::new();
+            let listener = SyslogListener::with_port(1514);
             if let Err(e) = listener.run(tx).await {
                 error!("Syslog listener failed: {:#}", e);
             } else {

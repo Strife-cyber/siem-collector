@@ -5,6 +5,8 @@ use tokio::sync::mpsc;
 pub mod firewall;
 pub mod linux;
 pub mod webserver;
+
+#[cfg(target_os = "windows")]
 pub mod windows;
 
 #[async_trait]

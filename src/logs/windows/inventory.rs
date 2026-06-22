@@ -45,6 +45,7 @@ impl WindowsInventoryCollector {
     /// Collect one inventory snapshot by shelling out to `wmic`.
     async fn collect_inventory(&self) -> Vec<CollectorLogRecord> {
         let hostname = get_hostname();
+        #[allow(unused_mut)]
         let mut records = Vec::new();
 
         // Collect installed software list via wmic.
