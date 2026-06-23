@@ -6,6 +6,8 @@
 
 pub mod coordinator;
 pub mod logs;
+pub mod normalize;
+pub mod shipper;
 pub mod storage;
 pub mod types;
 pub mod utils;

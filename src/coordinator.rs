@@ -1,27 +1,31 @@
-//! Central coordinator — orchestrates all platform-specific collectors
-//! and writes every collected record into a single WAL file on disk.
+//! Central coordinator — orchestrates all platform-specific collectors,
+//! persists every record to a WAL file, and optionally ships batches
+//! to a remote SIEM endpoint.
 //!
 //! # Architecture
 //!
 //! ```text
-//!                        ┌─────────────────────┐
-//!                        │  Central Coordinator │
-//!                        │  (owns WAL + channel)│
-//!                        └──┬──────┬──────┬─────┘
-//!                    clone  │      │      │  clone
-//!                      ┌────┘  ┌───┘  ┌──┘
-//!                      ▼       ▼      ▼
-//!               ┌──────────┐ ┌────┐ ┌────┐
-//!               │ Windows  │ │Linux│ │... │   ← platform coordinators
-//!               │Coordinator│ │  †  │ │ †  │
-//!               └──────────┘ └────┘ └────┘
+//!                        ┌──────────────────────────┐
+//!                        │    Central Coordinator    │
+//!                        │  (owns WAL + channels)    │
+//!                        └──┬──────┬──────┬──────┬───┘
+//!                    clone  │      │      │      │
+//!                      ┌────┘  ┌───┘  ┌──┘   ┌─┘
+//!                      ▼       ▼      ▼       ▼
+//!               ┌──────────┐ ┌────┐ ┌────┐ ┌──────────┐
+//!               │ Windows  │ │Linux│ │Web  │ │  Firewall│
+//!               │Coordinator│ │   † │ │Srvr │ │  Syslog │
+//!               └──────────┘ └────┘ └────┘ └──────────┘
+//!                      │       │      │        │
+//!                      └───────┴──────┴────────┘
+//!                              │
+//!                     ┌────────┴────────┐
+//!                     ▼                 ▼
+//!              ┌────────────┐   ┌──────────────┐
+//!              │ WAL writer │   │   Shipper    │
+//!              │ (always on)│   │ (if endpoint)│
+//!              └────────────┘   └──────────────┘
 //! ```
-//!
-//! † Not yet implemented — the central coordinator is ready to accept them.
-//!
-//! Each platform coordinator receives a `Sender<CollectorLogRecord>`, spawns
-//! its own collectors, and pushes records into the shared channel.  The
-//! central coordinator drains that channel and persists via `storage::write_record`.
 
 use std::path::PathBuf;
 
@@ -29,26 +33,30 @@ use anyhow::Result;
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
+use crate::shipper::{ShipperConfig, run_shipper};
 use crate::types::CollectorLogRecord;
 
 /// How many events can be buffered in-memory before blocking collectors.
 const CHANNEL_BUFFER: usize = 4096;
 
+/// How many events can be buffered for the shipper before we start dropping
+/// records (the WAL always captures everything regardless).
+const SHIPPER_CHANNEL_BUFFER: usize = 16384;
+
 /// Central coordinator that owns the WAL file and runs all platform coordinators.
 pub struct Coordinator {
     wal_dir: PathBuf,
+    shipper_config: Option<ShipperConfig>,
 }
 
 impl Coordinator {
-    /// Create a new coordinator.
-    ///
-    /// The WAL file will be placed inside the platform-specific local data
-    /// directory provided by the `directories` crate.
-    pub fn new() -> Result<Self> {
+    /// Create a new coordinator with optional shipper config.
+    pub fn new(shipper_config: Option<ShipperConfig>) -> Result<Self> {
         let project_dirs = directories::ProjectDirs::from("", "", "siem-collector")
             .ok_or_else(|| anyhow::anyhow!("failed to determine data directory"))?;
         Ok(Self {
             wal_dir: project_dirs.data_local_dir().to_path_buf(),
+            shipper_config,
         })
     }
 
@@ -66,8 +74,12 @@ impl Coordinator {
             .open(&wal_path)
             .await?;
 
-        // ── 2. Shared channel ─────────────────────────────────────────
+        // ── 2. Shared channels ─────────────────────────────────────────
+        // Main channel: platform coordinators → WAL writer + forwarder.
         let (tx, mut rx) = mpsc::channel::<CollectorLogRecord>(CHANNEL_BUFFER);
+        // Shipper channel: forwarder → HTTP shipper (separate so the WAL
+        // writer never blocks on a slow endpoint).
+        let (shipper_tx, shipper_rx) = mpsc::channel::<CollectorLogRecord>(SHIPPER_CHANNEL_BUFFER);
 
         // ── 3. Spawn platform coordinators ────────────────────────────
         let mut platform_handles = Vec::new();
@@ -102,9 +114,7 @@ impl Coordinator {
             }));
         }
 
-        // ── Web servers (Nginx, Apache, Traefik) ─────────────────────-
-        // Web server collectors are primarily Linux-based but the coordinator
-        // is platform-agnostic so it's always available.
+        // ── Web servers ────────────────────────────────────────────────
         {
             let ws_tx = tx.clone();
             platform_handles.push(tokio::spawn(async move {
@@ -118,7 +128,7 @@ impl Coordinator {
             }));
         }
 
-        // ── Firewall (syslog listener on UDP 514) ──────────────────────
+        // ── Firewall ───────────────────────────────────────────────────
         {
             let fw_tx = tx.clone();
             platform_handles.push(tokio::spawn(async move {
@@ -132,15 +142,29 @@ impl Coordinator {
             }));
         }
 
-        // Future platform coordinators go here:
-        //   - Cisco / network device coordinator → tx.clone()
-        //   - etc.
+        // ── 4. Spawn shipper (if configured) ──────────────────────────
+        let mut shipper_handle = None;
+        if let Some(config) = &self.shipper_config {
+            let cfg = config.clone();
+            shipper_handle = Some(tokio::spawn(async move {
+                if let Err(e) = run_shipper(shipper_rx, cfg).await {
+                    error!("Shipper failed: {:#}", e);
+                } else {
+                    info!("Shipper finished");
+                }
+            }));
+        } else {
+            // No endpoint configured — drop the shipper receiver so the
+            // channel doesn't stay open.
+            drop(shipper_rx);
+            info!("Shipper disabled (set SIEM_ENDPOINT to enable)");
+        }
 
         // Drop the original sender so the channel closes once **every**
         // platform coordinator has dropped its own clone.
         drop(tx);
 
-        // ── 4. Write loop ─────────────────────────────────────────────
+        // ── 5. Write loop (with forwarding to shipper) ─────────────────
         info!(
             "Pipeline running — {} platform task(s) active, writing records to WAL",
             platform_handles.len()
@@ -151,8 +175,13 @@ impl Coordinator {
 
             result = async {
                 while let Some(record) = rx.recv().await {
+                    // Always persist to WAL (durable storage).
                     if let Err(e) = crate::storage::write_record(&mut file, &record).await {
                         error!("Failed to write record to WAL: {:#}", e);
+                    }
+                    // Best-effort forward to shipper (drops if full).
+                    if shipper_tx.try_send(record).is_err() {
+                        // Shipper falling behind — records are safe in WAL.
                     }
                 }
                 Ok::<_, anyhow::Error>(())
@@ -162,16 +191,23 @@ impl Coordinator {
 
             _ = tokio::signal::ctrl_c() => {
                 info!("Received Ctrl+C, initiating graceful shutdown…");
-                // The rx goes out of scope → dropped → all senders detect
-                // is_closed() → collectors stop → platform coordinators return.
             }
         }
 
-        // ── 5. Wait for platform coordinators ─────────────────────────
-        info!("Waiting for platform coordinator tasks to finish…");
+        // ── 6. Wait for all tasks ──────────────────────────────────────
+        info!("Waiting for collector tasks to finish…");
         for handle in platform_handles {
             if let Err(e) = handle.await {
                 error!("Platform coordinator task failed to join: {}", e);
+            }
+        }
+
+        if let Some(handle) = shipper_handle {
+            info!("Waiting for shipper to flush…");
+            // Drop the shipper sender to signal the shipper to stop.
+            drop(shipper_tx);
+            if let Err(e) = handle.await {
+                error!("Shipper task failed to join: {}", e);
             }
         }
 
