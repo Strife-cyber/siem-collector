@@ -4,6 +4,7 @@
 //! web server, and network device logs) and persists them to a local
 //! write-ahead log (WAL) file for reliable shipping to a central SIEM.
 
+pub mod config;
 pub mod coordinator;
 pub mod logs;
 pub mod normalize;

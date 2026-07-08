@@ -11,15 +11,20 @@ async fn main() {
 
     info!("Starting SIEM Collector");
 
-    // Load shipper config from environment (optional — set SIEM_ENDPOINT).
-    let shipper_config = siem_collector::shipper::ShipperConfig::from_env();
+    // Load config: drop a `siem-collector.toml` next to the .exe, or use env vars.
+    let config = siem_collector::config::CollectorConfig::build();
+    let shipper_config = config.shipper_config();
+
     if shipper_config.is_some() {
-        info!("Shipper configured via environment variables");
+        info!("Shipper configured");
     } else {
-        info!("Shipper disabled — set SIEM_ENDPOINT to enable");
+        info!("Shipper disabled — set siem_endpoint in siem-collector.toml or SIEM_ENDPOINT env var");
     }
 
-    let coordinator = match siem_collector::coordinator::Coordinator::new(shipper_config) {
+    let coordinator = match siem_collector::coordinator::Coordinator::new(
+        shipper_config,
+        config.wal_dir.clone(),
+    ) {
         Ok(c) => c,
         Err(e) => {
             error!("Failed to create coordinator: {:#}", e);

@@ -1,33 +1,47 @@
 //! Shared Windows Event Log subscription engine.
 //!
-//! Provides a blocking loop that queries a Windows Event Log channel
-//! using `EvtQuery` / `EvtNext` / `EvtRender`, converts each event
-//! to a `CollectorLogRecord`, and pushes it into a tokio `Sender`.
+//! Uses `EvtQuery` (polling) with a time-based bookmark file so the collector
+//! never re-sends events that were already shipped across restarts — without
+//! requiring Administrator privileges.
 //!
-//! All collectors in this module delegate to [`subscribe_and_collect`].
+//! # How bookmarks work
+//!
+//! After each event, we extract the `<TimeCreated SystemTime="...">` from the
+//! rendered XML and persist the latest timestamp to a `.bookmark` file.
+//! On restart the timestamp is baked into the XPath query filter, skipping
+//! events older than the cutoff.
+//!
+//! This means a handful of events at the same millisecond boundary may be
+//! re-processed on restart, which is vastly better than re-sending every
+//! event in the channel.
+
+use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::Result;
 use tokio::sync::mpsc::Sender;
-use tracing::{error, trace, warn};
+use tracing::{error, info, trace, warn};
+
+use windows::Win32::Foundation::ERROR_NO_MORE_ITEMS;
+use windows::Win32::System::EventLog::{EvtClose, EvtNext, EvtQuery, EvtRender, EVT_HANDLE};
+use windows::core::PCWSTR;
 
 use crate::types::{CollectorLogRecord, SourceType};
 
-use windows::Win32::Foundation::ERROR_NO_MORE_ITEMS;
-
 /// HRESULT encoding of `ERROR_NO_MORE_ITEMS` (0x80070103).
-/// `EvtNext` returns a Win32 error via `GetLastError`, but
-/// `windows::core::Error::from_win32()` surfaces it as an HRESULT.
 const ERROR_NO_MORE_ITEMS_HR: i32 = (0x80070000u32 | ERROR_NO_MORE_ITEMS.0) as i32;
-use windows::Win32::System::EventLog::{EVT_HANDLE, EvtClose, EvtNext, EvtQuery, EvtRender};
-use windows::core::PCWSTR;
 
-/// Default polling interval when no new events are available (milliseconds).
-const POLL_MS: u64 = 1_000;
+/// Polling interval in milliseconds when no new events are available.
+const POLL_MS: u32 = 1_000;
+
+/// How often to flush the bookmark timestamp to disk.
+const BOOKMARK_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 /// Render an event handle into an XML string.
-///
-/// Calls `EvtRender` twice: first to discover the required buffer size,
-/// then to fill it.
 unsafe fn render_event_xml(event: EVT_HANDLE) -> Result<String> {
     let mut buffer_used = 0u32;
     let mut prop_count = 0u32;
@@ -49,7 +63,6 @@ unsafe fn render_event_xml(event: EVT_HANDLE) -> Result<String> {
         anyhow::bail!("EvtRender returned zero buffer size");
     }
 
-    // buffer_used is in bytes; result is UTF-16LE.
     let mut buffer = vec![0u8; buffer_used as usize];
 
     unsafe {
@@ -62,10 +75,10 @@ unsafe fn render_event_xml(event: EVT_HANDLE) -> Result<String> {
             &mut buffer_used,
             &mut prop_count,
         )
-        .map_err(|e| anyhow::anyhow!("EvtRender second call failed: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("EvtRender failed: {}", e))?;
     }
 
-    // The buffer contains UTF-16LE text. Trim trailing nulls.
+    // Buffer is UTF-16LE. Trim trailing nulls.
     let u16_len = buffer.len() / 2;
     let u16_slice = unsafe { std::slice::from_raw_parts(buffer.as_ptr() as *const u16, u16_len) };
     let effective_len = u16_slice
@@ -73,48 +86,134 @@ unsafe fn render_event_xml(event: EVT_HANDLE) -> Result<String> {
         .rposition(|&c| c != 0)
         .map(|pos| pos + 1)
         .unwrap_or(0);
+
     Ok(String::from_utf16_lossy(&u16_slice[..effective_len]))
 }
 
-/// Run a blocking Event Log query loop.
+/// Extract the `SystemTime` value from a rendered Event XML string.
+///
+/// Looks for `SystemTime="..."` in the XML and returns the value.
+/// Returns `None` if not found.
+fn extract_system_time(xml: &str) -> Option<String> {
+    let needle = "SystemTime=\"";
+    let start = xml.find(needle)?;
+    let value_start = start + needle.len();
+    let value_end = xml[value_start..].find('"')?;
+    Some(xml[value_start..value_start + value_end].to_string())
+}
+
+/// Save a timestamp string to the bookmark file.
+fn save_bookmark(path: &Path, timestamp: &str) {
+    if let Err(e) = std::fs::write(path, timestamp) {
+        warn!(path = %path.display(), error = %e, "Failed to save bookmark");
+    } else {
+        trace!(path = %path.display(), ts = %timestamp, "Bookmark saved");
+    }
+}
+
+/// Read the saved timestamp from a bookmark file.
+fn load_bookmark(path: &Path) -> Option<String> {
+    if !path.exists() {
+        return None;
+    }
+    let ts = std::fs::read_to_string(path).ok()?;
+    let ts = ts.trim().to_string();
+    if ts.is_empty() { None } else { Some(ts) }
+}
+
+// ---------------------------------------------------------------------------
+// Public entry point
+// ---------------------------------------------------------------------------
+
+/// Run a blocking Event Log query loop with time-based bookmark persistence.
 ///
 /// Opens a query on `channel` with `xpath_query`, polls for new events,
 /// renders them as XML, and sends each one through `sender`.
+///
+/// **Bookmarking**: If `bookmark_path` is set, a timestamp of the latest
+/// event is periodically persisted. On the next start the timestamp is used
+/// to filter out already-sent events via an XPath `TimeCreated >= ...` clause.
 pub(crate) fn subscribe_and_collect(
     channel: String,
     xpath_query: String,
     source_type: SourceType,
     sender: Sender<CollectorLogRecord>,
     hostname: String,
+    bookmark_path: Option<PathBuf>,
 ) -> Result<()> {
+    // Ensure bookmark directory exists.
+    if let Some(ref path) = bookmark_path {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
+
+    // ── 1. Build the effective XPath query ─────────────────────────────
+    // If we have a saved bookmark timestamp, add a TimeCreated filter to
+    // skip events that were already sent.
+    let effective_query = if let Some(ref path) = bookmark_path {
+        if let Some(ts) = load_bookmark(path) {
+            info!(
+                channel = %channel,
+                timestamp = %ts,
+                "Skipping events before saved bookmark"
+            );
+            // Strip the leading `*` or `*[` and inject the time filter.
+            // If the query is `*`, replace with a time-filtered version.
+            // If the query already has `[...]`, append the time filter.
+            if xpath_query == "*" {
+                format!(
+                    "*[System/TimeCreated[@SystemTime >= '{}']]",
+                    ts
+                )
+            } else {
+                // Insert the time filter inside the existing predicates
+                // by wrapping the whole thing.
+                format!(
+                    "*[System/TimeCreated[@SystemTime >= '{}'] and ({})]",
+                    ts,
+                    &xpath_query[2..] // strip "*[" prefix
+                )
+            }
+        } else {
+            xpath_query.clone()
+        }
+    } else {
+        xpath_query.clone()
+    };
+
     // Convert to wide strings.
     let channel_wide: Vec<u16> = channel.encode_utf16().chain(std::iter::once(0)).collect();
-    let query_wide: Vec<u16> = xpath_query
+    let query_wide: Vec<u16> = effective_query
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
 
+    // ── 2. Open query ──────────────────────────────────────────────────
     // EvtQueryChannelPath (0x1) | EvtQueryForwardDirection (0x100) | EvtQueryTolerateQueryErrors (0x1000)
-    let flags = 0x1 | 0x100 | 0x1000;
+    let query_flags = 0x1 | 0x100 | 0x1000;
 
     let query_handle = unsafe {
         EvtQuery(
             None,
             PCWSTR::from_raw(channel_wide.as_ptr()),
             PCWSTR::from_raw(query_wide.as_ptr()),
-            flags,
+            query_flags,
         )
         .map_err(|e| anyhow::anyhow!("EvtQuery failed for channel '{}': {}", channel, e))?
     };
 
+    // ── 3. Event loop ──────────────────────────────────────────────────
     let event_batch_size = 16usize;
     let mut raw_events = vec![0isize; event_batch_size];
+    let mut latest_timestamp: Option<String> = None;
+    let mut last_bookmark_save = Instant::now();
 
     loop {
         // Check if the receiver has been dropped (shutdown signal).
         if sender.is_closed() {
-            let _ = unsafe { EvtClose(query_handle) };
-            return Ok(());
+            info!(channel = %channel, "Sender closed, shutting down");
+            break;
         }
 
         let mut returned = 0u32;
@@ -123,19 +222,31 @@ pub(crate) fn subscribe_and_collect(
             EvtNext(
                 query_handle,
                 &mut raw_events,
-                std::time::Duration::from_millis(POLL_MS).as_millis() as u32,
+                POLL_MS,
                 0,
                 &mut returned,
             )
         };
 
         if ok.is_ok() {
-            // Process returned events.
             for i in 0..returned as usize {
                 let event = EVT_HANDLE(raw_events[i]);
                 match unsafe { render_event_xml(event) } {
                     Ok(xml) => {
                         trace!(channel, xml_len = xml.len(), "Event rendered");
+
+                        // Track latest timestamp for bookmarking.
+                        if let Some(ts) = extract_system_time(&xml) {
+                            // Keep the max timestamp.
+                            let update = match &latest_timestamp {
+                                Some(current) => ts > *current,
+                                None => true,
+                            };
+                            if update {
+                                latest_timestamp = Some(ts);
+                            }
+                        }
+
                         let record = CollectorLogRecord::new(
                             source_type.clone(),
                             hostname.clone(),
@@ -147,6 +258,11 @@ pub(crate) fn subscribe_and_collect(
                                 let _ = unsafe { EvtClose(EVT_HANDLE(raw_events[j])) };
                             }
                             let _ = unsafe { EvtClose(query_handle) };
+                            if let Some(ref path) = bookmark_path {
+                                if let Some(ref ts) = latest_timestamp {
+                                    save_bookmark(path, ts);
+                                }
+                            }
                             return Ok(());
                         }
                     }
@@ -156,24 +272,46 @@ pub(crate) fn subscribe_and_collect(
                 }
                 let _ = unsafe { EvtClose(event) };
             }
+
+            // Periodically persist the bookmark timestamp to disk.
+            if let Some(ref path) = bookmark_path {
+                if let Some(ref ts) = latest_timestamp {
+                    if last_bookmark_save.elapsed() >= BOOKMARK_SAVE_INTERVAL {
+                        save_bookmark(path, ts);
+                        last_bookmark_save = Instant::now();
+                    }
+                }
+            }
         } else {
             let err_code = windows::core::Error::from_win32();
             let code = err_code.code().0;
 
             if code == ERROR_NO_MORE_ITEMS_HR {
-                // No new events — normal, poll again after a short sleep.
+                // No new events — normal, poll again.
                 trace!("No new events on '{}', retrying…", channel);
-                std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
             } else {
                 // Real error — log at warn and back off.
                 warn!(
                     "EvtNext error for channel '{}': {} (code {})",
                     channel, err_code, code
                 );
-                std::thread::sleep(std::time::Duration::from_millis(POLL_MS * 5));
+                std::thread::sleep(std::time::Duration::from_millis(5000));
             }
         }
     }
+
+    // ── 4. Cleanup — final bookmark save ──────────────────────────────
+    if let Some(ref path) = bookmark_path {
+        if let Some(ref ts) = latest_timestamp {
+            save_bookmark(path, ts);
+        }
+    }
+
+    unsafe {
+        let _ = EvtClose(query_handle);
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -182,9 +320,7 @@ pub(crate) fn subscribe_and_collect(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::mpsc;
 
-    /// Rendering an invalid handle should fail.
     #[test]
     fn render_invalid_handle_returns_error() {
         let handle = EVT_HANDLE(0);
@@ -192,10 +328,36 @@ mod tests {
         assert!(result.is_err(), "Expected error for null/invalid handle");
     }
 
-    /// subscribe_and_collect with a non-existent channel and a dropped receiver
-    /// should exit cleanly.
+    #[test]
+    fn extract_system_time_from_typical_xml() {
+        let xml = r#"<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event">
+  <System>
+    <Provider Name="Microsoft-Windows-Security-Auditing" Guid="{54849625-5478-4994-A5BA-3E3B0328C30D}"/>
+    <EventID>4624</EventID>
+    <Version>2</Version>
+    <Level>0</Level>
+    <Task>12544</Task>
+    <Opcode>0</Opcode>
+    <Keywords>0x8020000000000000</Keywords>
+    <TimeCreated SystemTime="2025-07-08T18:30:00.1234567Z"/>
+    <EventRecordID>12345</EventRecordID>
+  </System>
+</Event>"#;
+        assert_eq!(
+            extract_system_time(xml),
+            Some("2025-07-08T18:30:00.1234567Z".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_system_time_returns_none_when_missing() {
+        assert_eq!(extract_system_time("<Event></Event>"), None);
+    }
+
     #[tokio::test]
     async fn nonexistent_channel_errors() {
+        use tokio::sync::mpsc;
+
         let (tx, rx) = mpsc::channel::<CollectorLogRecord>(16);
 
         let handle = tokio::task::spawn_blocking(move || {
@@ -205,6 +367,7 @@ mod tests {
                 SourceType::Custom("test".to_string()),
                 tx,
                 "test-host".to_string(),
+                None,
             )
         });
 
@@ -212,7 +375,6 @@ mod tests {
         drop(rx);
 
         let result = handle.await.unwrap();
-        // Should either succeed (sender dropped) or fail with channel error.
         assert!(result.is_ok() || result.is_err());
     }
 }

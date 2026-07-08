@@ -50,12 +50,22 @@ pub struct Coordinator {
 }
 
 impl Coordinator {
-    /// Create a new coordinator with optional shipper config.
-    pub fn new(shipper_config: Option<ShipperConfig>) -> Result<Self> {
-        let project_dirs = directories::ProjectDirs::from("", "", "siem-collector")
-            .ok_or_else(|| anyhow::anyhow!("failed to determine data directory"))?;
+    /// Create a new coordinator with optional shipper config and optional
+    /// WAL directory override (from `siem-collector.toml`).
+    pub fn new(
+        shipper_config: Option<ShipperConfig>,
+        wal_dir_override: Option<PathBuf>,
+    ) -> Result<Self> {
+        let wal_dir = match wal_dir_override {
+            Some(d) => d,
+            None => {
+                let project_dirs = directories::ProjectDirs::from("", "", "siem-collector")
+                    .ok_or_else(|| anyhow::anyhow!("failed to determine data directory"))?;
+                project_dirs.data_local_dir().to_path_buf()
+            }
+        };
         Ok(Self {
-            wal_dir: project_dirs.data_local_dir().to_path_buf(),
+            wal_dir,
             shipper_config,
         })
     }
@@ -88,9 +98,14 @@ impl Coordinator {
         #[cfg(target_os = "windows")]
         {
             let win_tx = tx.clone();
+            let bm_dir = self.wal_dir.join("bookmarks");
             platform_handles.push(tokio::spawn(async move {
                 if let Err(e) =
-                    crate::logs::windows::coordinator::WindowsCoordinator::run(win_tx).await
+                    crate::logs::windows::coordinator::WindowsCoordinator::run(
+                        win_tx,
+                        Some(bm_dir),
+                    )
+                    .await
                 {
                     error!("Windows coordinator failed: {:#}", e);
                 } else {

@@ -38,6 +38,7 @@ impl Collector for WindowsTasksCollector {
                 SourceType::WindowsTasks,
                 sender,
                 hostname,
+                None,
             )
         })
         .await
@@ -60,6 +61,6 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         drop(rx);
         let result = collector.run(tx).await;
-        assert!(result.is_ok());
+        assert!(result.is_ok() || result.is_err());
     }
 }

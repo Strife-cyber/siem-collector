@@ -3,7 +3,12 @@
 //! Spawns all Windows Event Log collectors and feeds their records
 //! into the shared mpsc channel owned by the central [`Coordinator`].
 //!
+//! Each collector gets a persisted bookmark file so it resumes exactly
+//! where it left off after a restart.
+//!
 //! [`Coordinator`]: crate::coordinator::Coordinator
+
+use std::path::PathBuf;
 
 use anyhow::Result;
 use tokio::sync::mpsc;
@@ -35,18 +40,39 @@ const ALL_COLLECTORS: &[(&str, &str)] = &[
 /// Windows platform coordinator.
 ///
 /// Receives a sender into the central channel, creates every Windows
-/// collector, spawns them as tokio tasks, and waits for completion.
+/// collector with bookmark support, spawns them as tokio tasks, and
+/// waits for completion.
 pub struct WindowsCoordinator;
 
 impl WindowsCoordinator {
     /// Run all Windows collectors, feeding records into `sender`.
-    pub async fn run(sender: mpsc::Sender<CollectorLogRecord>) -> Result<()> {
+    ///
+    /// `bookmark_dir` is the directory where per-channel bookmark files
+    /// are stored (typically `<wal_dir>/bookmarks`).
+    pub async fn run(
+        sender: mpsc::Sender<CollectorLogRecord>,
+        bookmark_dir: Option<PathBuf>,
+    ) -> Result<()> {
         info!("Starting {} Windows collectors", ALL_COLLECTORS.len());
 
+        // Build bookmark paths for each channel-based collector.
+        let bookmark = |name: &str| -> Option<PathBuf> {
+            bookmark_dir.as_ref().map(|d| d.join(format!("{}.bookmark", name)))
+        };
+
         let collectors: Vec<Box<dyn Collector>> = vec![
-            Box::new(WindowsEventLogCollector::new("Security")),
-            Box::new(WindowsEventLogCollector::new("System")),
-            Box::new(WindowsEventLogCollector::new("Application")),
+            Box::new(
+                WindowsEventLogCollector::new("Security")
+                    .with_bookmark(bookmark("Security")),
+            ),
+            Box::new(
+                WindowsEventLogCollector::new("System")
+                    .with_bookmark(bookmark("System")),
+            ),
+            Box::new(
+                WindowsEventLogCollector::new("Application")
+                    .with_bookmark(bookmark("Application")),
+            ),
             Box::new(WindowsFimCollector),
             Box::new(WindowsNetworkCollector),
             Box::new(WindowsProcessCollector),
