@@ -101,11 +101,8 @@ impl Coordinator {
             let bm_dir = self.wal_dir.join("bookmarks");
             platform_handles.push(tokio::spawn(async move {
                 if let Err(e) =
-                    crate::logs::windows::coordinator::WindowsCoordinator::run(
-                        win_tx,
-                        Some(bm_dir),
-                    )
-                    .await
+                    crate::logs::windows::coordinator::WindowsCoordinator::run(win_tx, Some(bm_dir))
+                        .await
                 {
                     error!("Windows coordinator failed: {:#}", e);
                 } else {
@@ -130,6 +127,8 @@ impl Coordinator {
         }
 
         // ── Web servers ────────────────────────────────────────────────
+        // Only run on platforms with Linux-style log paths.
+        #[cfg(not(target_os = "windows"))]
         {
             let ws_tx = tx.clone();
             platform_handles.push(tokio::spawn(async move {

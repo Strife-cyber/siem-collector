@@ -6,7 +6,7 @@
 
 use anyhow::Result;
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{info, warn};
 
 use crate::logs::Collector;
 use crate::logs::webserver::{
@@ -57,7 +57,7 @@ impl WebServerCoordinator {
             handles.push(tokio::spawn(async move {
                 let mut c = collector;
                 if let Err(e) = c.run(tx).await {
-                    error!("Web server collector '{}' failed: {:#}", name, e);
+                    warn!("Web server collector '{}' failed: {:#}", name, e);
                 } else {
                     info!("Web server collector '{}' finished", name);
                 }

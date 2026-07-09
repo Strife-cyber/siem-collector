@@ -23,7 +23,7 @@ use tokio::sync::mpsc::Sender;
 use tracing::{error, info, trace, warn};
 
 use windows::Win32::Foundation::ERROR_NO_MORE_ITEMS;
-use windows::Win32::System::EventLog::{EvtClose, EvtNext, EvtQuery, EvtRender, EVT_HANDLE};
+use windows::Win32::System::EventLog::{EVT_HANDLE, EvtClose, EvtNext, EvtQuery, EvtRender};
 use windows::core::PCWSTR;
 
 use crate::types::{CollectorLogRecord, SourceType};
@@ -92,14 +92,52 @@ unsafe fn render_event_xml(event: EVT_HANDLE) -> Result<String> {
 
 /// Extract the `SystemTime` value from a rendered Event XML string.
 ///
-/// Looks for `SystemTime="..."` in the XML and returns the value.
+/// Looks for `SystemTime="..."` in the XML and returns the value
+/// **truncated to millisecond precision** (3 fractional digits) for
+/// reliable XPath comparison on restart.
+///
 /// Returns `None` if not found.
 fn extract_system_time(xml: &str) -> Option<String> {
     let needle = "SystemTime=\"";
     let start = xml.find(needle)?;
     let value_start = start + needle.len();
     let value_end = xml[value_start..].find('"')?;
-    Some(xml[value_start..value_start + value_end].to_string())
+    let raw = &xml[value_start..value_start + value_end];
+
+    // Truncate to milliseconds (3 fractional digits) for XPath compatibility.
+    // Windows uses format: 2025-07-08T18:30:00.123Z  (or .1234567Z with full precision)
+    // XPath comparison with >3 fractional digits can fail silently.
+    Some(truncate_timestamp_ms(raw))
+}
+
+/// Truncate a Windows SystemTime to millisecond precision for XPath queries.
+///
+/// `2025-07-08T18:30:00.1234567Z` → `2025-07-08T18:30:00.123Z`
+fn truncate_timestamp_ms(ts: &str) -> String {
+    if let Some(dot) = ts.find('.') {
+        if let Some(z) = ts.rfind('Z').or_else(|| ts.rfind('z')) {
+            // Take up to 3 digits after the decimal point.
+            let mut result = String::with_capacity(dot + 1 + 3 + 1);
+            result.push_str(&ts[..=dot]);
+            // Pad or truncate to exactly 3 fractional digits.
+            let frac = &ts[dot + 1..z];
+            match frac.len() {
+                0 => result.push_str("000"),
+                1 => {
+                    result.push_str(frac);
+                    result.push_str("00");
+                }
+                2 => {
+                    result.push_str(frac);
+                    result.push('0');
+                }
+                _ => result.push_str(&frac[..3]),
+            }
+            result.push('Z');
+            return result;
+        }
+    }
+    ts.to_string()
 }
 
 /// Save a timestamp string to the bookmark file.
@@ -162,10 +200,7 @@ pub(crate) fn subscribe_and_collect(
             // If the query is `*`, replace with a time-filtered version.
             // If the query already has `[...]`, append the time filter.
             if xpath_query == "*" {
-                format!(
-                    "*[System/TimeCreated[@SystemTime >= '{}']]",
-                    ts
-                )
+                format!("*[System/TimeCreated[@SystemTime >= '{}']]", ts)
             } else {
                 // Insert the time filter inside the existing predicates
                 // by wrapping the whole thing.
@@ -208,6 +243,12 @@ pub(crate) fn subscribe_and_collect(
     let mut raw_events = vec![0isize; event_batch_size];
     let mut latest_timestamp: Option<String> = None;
     let mut last_bookmark_save = Instant::now();
+    let mut empty_polls = 0u32;
+    let mut has_ever_received = false;
+    let is_primary_channel = matches!(
+        channel.to_lowercase().as_str(),
+        "security" | "system" | "application"
+    ) && xpath_query == "*";
 
     loop {
         // Check if the receiver has been dropped (shutdown signal).
@@ -218,21 +259,15 @@ pub(crate) fn subscribe_and_collect(
 
         let mut returned = 0u32;
 
-        let ok = unsafe {
-            EvtNext(
-                query_handle,
-                &mut raw_events,
-                POLL_MS,
-                0,
-                &mut returned,
-            )
-        };
+        let ok = unsafe { EvtNext(query_handle, &mut raw_events, POLL_MS, 0, &mut returned) };
 
         if ok.is_ok() {
+            empty_polls = 0;
             for i in 0..returned as usize {
                 let event = EVT_HANDLE(raw_events[i]);
                 match unsafe { render_event_xml(event) } {
                     Ok(xml) => {
+                        has_ever_received = true;
                         trace!(channel, xml_len = xml.len(), "Event rendered");
 
                         // Track latest timestamp for bookmarking.
@@ -289,6 +324,19 @@ pub(crate) fn subscribe_and_collect(
             if code == ERROR_NO_MORE_ITEMS_HR {
                 // No new events — normal, poll again.
                 trace!("No new events on '{}', retrying…", channel);
+
+                // Detect silent permission failure once per primary channel.
+                empty_polls += 1;
+                if empty_polls >= 5 && is_primary_channel && !has_ever_received {
+                    warn!(
+                        channel = %channel,
+                        "No events after {} polls — process may lack permission to read the \
+                        Event Log. Run as Administrator or join the 'Event Log Readers' \
+                        group.",
+                        empty_polls,
+                    );
+                    empty_polls = u32::MAX / 2;
+                }
             } else {
                 // Real error — log at warn and back off.
                 warn!(
@@ -343,15 +391,48 @@ mod tests {
     <EventRecordID>12345</EventRecordID>
   </System>
 </Event>"#;
+        // Truncated to 3 fractional digits for XPath compatibility.
         assert_eq!(
             extract_system_time(xml),
-            Some("2025-07-08T18:30:00.1234567Z".to_string())
+            Some("2025-07-08T18:30:00.123Z".to_string())
         );
     }
 
     #[test]
     fn extract_system_time_returns_none_when_missing() {
         assert_eq!(extract_system_time("<Event></Event>"), None);
+    }
+
+    #[test]
+    fn truncate_full_precision_to_ms() {
+        assert_eq!(
+            truncate_timestamp_ms("2025-07-08T18:30:00.1234567Z"),
+            "2025-07-08T18:30:00.123Z"
+        );
+    }
+
+    #[test]
+    fn truncate_ms_already() {
+        assert_eq!(
+            truncate_timestamp_ms("2025-07-08T18:30:00.123Z"),
+            "2025-07-08T18:30:00.123Z"
+        );
+    }
+
+    #[test]
+    fn truncate_no_fractional() {
+        assert_eq!(
+            truncate_timestamp_ms("2025-07-08T18:30:00Z"),
+            "2025-07-08T18:30:00Z"
+        );
+    }
+
+    #[test]
+    fn truncate_one_digit() {
+        assert_eq!(
+            truncate_timestamp_ms("2025-07-08T18:30:00.1Z"),
+            "2025-07-08T18:30:00.100Z"
+        );
     }
 
     #[tokio::test]
