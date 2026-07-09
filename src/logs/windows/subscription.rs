@@ -228,7 +228,7 @@ pub(crate) fn subscribe_and_collect(
     // EvtQueryChannelPath (0x1) | EvtQueryForwardDirection (0x100) | EvtQueryTolerateQueryErrors (0x1000)
     let query_flags = 0x1 | 0x100 | 0x1000;
 
-    let query_handle = unsafe {
+    let mut query_handle = unsafe {
         EvtQuery(
             None,
             PCWSTR::from_raw(channel_wide.as_ptr()),
@@ -322,10 +322,9 @@ pub(crate) fn subscribe_and_collect(
             let code = err_code.code().0;
 
             if code == ERROR_NO_MORE_ITEMS_HR {
-                // No new events — normal, poll again.
                 trace!("No new events on '{}', retrying…", channel);
 
-                // Detect silent permission failure once per primary channel.
+                // Detect silent permission failure (never received any event).
                 empty_polls += 1;
                 if empty_polls >= 5 && is_primary_channel && !has_ever_received {
                     warn!(
@@ -336,6 +335,51 @@ pub(crate) fn subscribe_and_collect(
                         empty_polls,
                     );
                     empty_polls = u32::MAX / 2;
+                }
+
+                // ── Reconnect: EvtQuery is a one-time snapshot, so we must close
+                // and reopen to see events written after the query was opened.
+                if has_ever_received {
+                    let _ = unsafe { EvtClose(query_handle) };
+
+                    // Build a time-filtered query that excludes already-sent events.
+                    let reconnect_query = if let Some(ref ts) = latest_timestamp {
+                        if xpath_query == "*" {
+                            format!("*[System/TimeCreated[@SystemTime >= '{}']]", ts)
+                        } else {
+                            format!(
+                                "*[System/TimeCreated[@SystemTime >= '{}'] and ({})]",
+                                ts,
+                                &xpath_query[2..]
+                            )
+                        }
+                    } else {
+                        xpath_query.clone()
+                    };
+
+                    let qw: Vec<u16> = reconnect_query
+                        .encode_utf16()
+                        .chain(std::iter::once(0))
+                        .collect();
+
+                    match unsafe {
+                        EvtQuery(
+                            None,
+                            PCWSTR::from_raw(channel_wide.as_ptr()),
+                            PCWSTR::from_raw(qw.as_ptr()),
+                            query_flags,
+                        )
+                    } {
+                        Ok(h) => {
+                            query_handle = h;
+                            trace!(channel = %channel, "Reopened EvtQuery for new events");
+                        }
+                        Err(e) => warn!(
+                            channel = %channel,
+                            error = %e,
+                            "Failed to reopen EvtQuery — will retry"
+                        ),
+                    }
                 }
             } else {
                 // Real error — log at warn and back off.
