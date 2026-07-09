@@ -44,6 +44,26 @@ pub struct CollectorConfig {
     /// Directory for the WAL file. Defaults to the system data directory
     /// (`%APPDATA%/siem-collector` on Windows).
     pub wal_dir: Option<PathBuf>,
+    /// Maximum WAL file size in megabytes before truncation (default: 500).
+    /// Set to 0 to disable WAL entirely.
+    pub wal_max_size_mb: Option<u64>,
+    /// Optional list of Windows Security Event IDs to collect.
+    /// If empty or unset, collects ALL events (default: all).
+    /// Example: [4624, 4625, 4648, 4768, 4769, 4776, 1102]
+    pub security_event_ids: Option<Vec<u32>>,
+}
+/// Build an XPath filter string from a list of event IDs.
+/// Returns `None` if the list is empty (meaning "collect all").
+pub fn build_security_filter(event_ids: &[u32]) -> Option<String> {
+    if event_ids.is_empty() {
+        return None;
+    }
+    let cond: String = event_ids
+        .iter()
+        .map(|id| format!("EventID={}", id))
+        .collect::<Vec<_>>()
+        .join(" or ");
+    Some(format!("*[System[({})]]", cond))
 }
 
 impl CollectorConfig {
@@ -104,9 +124,35 @@ impl CollectorConfig {
             endpoint: endpoint.clone(),
             api_key: self.siem_api_key.clone().filter(|k| !k.is_empty()),
             batch_size: self.siem_batch_size.unwrap_or(100),
-            batch_interval: std::time::Duration::from_secs(
-                self.siem_batch_interval.unwrap_or(5),
-            ),
+            batch_interval: std::time::Duration::from_secs(self.siem_batch_interval.unwrap_or(5)),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_filter_single_id() {
+        assert_eq!(
+            build_security_filter(&[4624]),
+            Some("*[System[(EventID=4624)]]".to_string()),
+        );
+    }
+
+    #[test]
+    fn build_filter_multiple_ids() {
+        let result = build_security_filter(&[4624, 4625, 1102]).unwrap();
+        assert!(result.contains("EventID=4624"));
+        assert!(result.contains("EventID=4625"));
+        assert!(result.contains("EventID=1102"));
+        assert!(result.starts_with("*[System["));
+        assert!(result.ends_with(")]]"));
+    }
+
+    #[test]
+    fn build_filter_empty_returns_none() {
+        assert_eq!(build_security_filter(&[]), None);
     }
 }

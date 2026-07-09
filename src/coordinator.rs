@@ -28,10 +28,12 @@
 //! ```
 
 use std::path::PathBuf;
+use std::time::Instant;
 
 use anyhow::Result;
+use tokio::io::AsyncSeekExt;
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::shipper::{ShipperConfig, run_shipper};
 use crate::types::CollectorLogRecord;
@@ -47,6 +49,8 @@ const SHIPPER_CHANNEL_BUFFER: usize = 16384;
 pub struct Coordinator {
     wal_dir: PathBuf,
     shipper_config: Option<ShipperConfig>,
+    wal_max_size: u64,
+    security_event_ids: Option<Vec<u32>>,
 }
 
 impl Coordinator {
@@ -55,6 +59,8 @@ impl Coordinator {
     pub fn new(
         shipper_config: Option<ShipperConfig>,
         wal_dir_override: Option<PathBuf>,
+        wal_max_size: u64,
+        security_event_ids: Option<Vec<u32>>,
     ) -> Result<Self> {
         let wal_dir = match wal_dir_override {
             Some(d) => d,
@@ -67,6 +73,8 @@ impl Coordinator {
         Ok(Self {
             wal_dir,
             shipper_config,
+            wal_max_size,
+            security_event_ids,
         })
     }
 
@@ -79,10 +87,13 @@ impl Coordinator {
 
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
-            .append(true)
+            .write(true)
             .read(true)
             .open(&wal_path)
             .await?;
+        // Seek to end for appending (not using append mode because set_len
+        // fails on Windows when the file is opened with append=true).
+        file.seek(std::io::SeekFrom::End(0)).await?;
 
         // ── 2. Shared channels ─────────────────────────────────────────
         // Main channel: platform coordinators → WAL writer + forwarder.
@@ -99,10 +110,14 @@ impl Coordinator {
         {
             let win_tx = tx.clone();
             let bm_dir = self.wal_dir.join("bookmarks");
+            let evt_ids = self.security_event_ids.clone();
             platform_handles.push(tokio::spawn(async move {
-                if let Err(e) =
-                    crate::logs::windows::coordinator::WindowsCoordinator::run(win_tx, Some(bm_dir))
-                        .await
+                if let Err(e) = crate::logs::windows::coordinator::WindowsCoordinator::run(
+                    win_tx,
+                    Some(bm_dir),
+                    evt_ids,
+                )
+                .await
                 {
                     error!("Windows coordinator failed: {:#}", e);
                 } else {
@@ -184,22 +199,32 @@ impl Coordinator {
             platform_handles.len()
         );
 
-        tokio::select! {
-            biased;  // prefer draining events over handling Ctrl+C
+        let mut last_wal_check = Instant::now();
+        const WAL_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
-            result = async {
-                while let Some(record) = rx.recv().await {
-                    // Always persist to WAL (durable storage).
-                    if let Err(e) = crate::storage::write_record(&mut file, &record).await {
-                        error!("Failed to write record to WAL: {:#}", e);
+        tokio::select! {
+                biased;  // prefer draining events over handling Ctrl+C
+
+                result = async {
+                    while let Some(record) = rx.recv().await {
+                        // Always persist to WAL (durable storage).
+                        if let Err(e) = crate::storage::write_record(&mut file, &record).await {
+                            error!("Failed to write record to WAL: {:#}", e);
+                        }
+                        // Check WAL size every 30 seconds (not after every write!).
+                        if last_wal_check.elapsed() >= WAL_CHECK_INTERVAL {
+                            last_wal_check = Instant::now();
+                            if let Err(e) = crate::storage::check_truncate_wal(&mut file, self.wal_max_size).await {
+                                warn!("Failed to truncate WAL: {:#}", e);
+                            }
+                        }
+                        // Best-effort forward to shipper (drops if full).
+                        if shipper_tx.try_send(record).is_err() {
+                            // Shipper falling behind — records are safe in WAL.
+                        }
                     }
-                    // Best-effort forward to shipper (drops if full).
-                    if shipper_tx.try_send(record).is_err() {
-                        // Shipper falling behind — records are safe in WAL.
-                    }
-                }
-                Ok::<_, anyhow::Error>(())
-            } => {
+                    Ok::<_, anyhow::Error>(())
+                } => {
                 result?;
             }
 

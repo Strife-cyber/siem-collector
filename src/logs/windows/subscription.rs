@@ -34,8 +34,9 @@ const ERROR_NO_MORE_ITEMS_HR: i32 = (0x80070000u32 | ERROR_NO_MORE_ITEMS.0) as i
 /// Polling interval in milliseconds when no new events are available.
 const POLL_MS: u32 = 1_000;
 
-/// How often to flush the bookmark timestamp to disk.
-const BOOKMARK_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+/// How often to flush the bookmark timestamp to disk (1 second — fast enough
+/// that a crash/kill rarely loses more than 1s of position data).
+const BOOKMARK_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -92,17 +93,23 @@ unsafe fn render_event_xml(event: EVT_HANDLE) -> Result<String> {
 
 /// Extract the `SystemTime` value from a rendered Event XML string.
 ///
-/// Looks for `SystemTime="..."` in the XML and returns the value
-/// **truncated to millisecond precision** (3 fractional digits) for
-/// reliable XPath comparison on restart.
+/// Handles both `SystemTime='...'` (Windows native) and
+/// `SystemTime="..."` (some serializers). Returns the value
+/// **truncated to millisecond precision** (3 fractional digits).
 ///
 /// Returns `None` if not found.
 fn extract_system_time(xml: &str) -> Option<String> {
-    let needle = "SystemTime=\"";
-    let start = xml.find(needle)?;
-    let value_start = start + needle.len();
-    let value_end = xml[value_start..].find('"')?;
-    let raw = &xml[value_start..value_start + value_end];
+    let marker = "SystemTime=";
+    let start = xml.find(marker)?;
+    // Determine which quote character follows the marker.
+    let after = &xml[(start + marker.len())..];
+    let quote = after.chars().next()?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+    let inner_start = start + marker.len() + 1;
+    let inner_end = xml[inner_start..].find(quote)?;
+    let raw = &xml[inner_start..inner_start + inner_end];
 
     // Truncate to milliseconds (3 fractional digits) for XPath compatibility.
     // Windows uses format: 2025-07-08T18:30:00.123Z  (or .1234567Z with full precision)
@@ -435,7 +442,22 @@ mod tests {
     <EventRecordID>12345</EventRecordID>
   </System>
 </Event>"#;
-        // Truncated to 3 fractional digits for XPath compatibility.
+        assert_eq!(
+            extract_system_time(xml),
+            Some("2025-07-08T18:30:00.123Z".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_system_time_single_quotes() {
+        // Windows native Event Log XML uses single quotes.
+        let xml = r#"<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'>
+  <System>
+    <Provider Name='Microsoft-Windows-Security-Auditing'/>
+    <EventID>4624</EventID>
+    <TimeCreated SystemTime='2025-07-08T18:30:00.1234567Z'/>
+  </System>
+</Event>"#;
         assert_eq!(
             extract_system_time(xml),
             Some("2025-07-08T18:30:00.123Z".to_string())

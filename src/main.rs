@@ -18,12 +18,20 @@ async fn main() {
     if shipper_config.is_some() {
         info!("Shipper configured");
     } else {
-        info!("Shipper disabled — set siem_endpoint in siem-collector.toml or SIEM_ENDPOINT env var");
+        info!(
+            "Shipper disabled — set siem_endpoint in siem-collector.toml or SIEM_ENDPOINT env var"
+        );
     }
+
+    let wal_max_mb = config.wal_max_size_mb.unwrap_or(500);
+    let wal_max_bytes = wal_max_mb * 1_048_576;
+    info!(wal_max_mb, "WAL max size configured");
 
     let coordinator = match siem_collector::coordinator::Coordinator::new(
         shipper_config,
         config.wal_dir.clone(),
+        wal_max_bytes,
+        config.security_event_ids.clone(),
     ) {
         Ok(c) => c,
         Err(e) => {

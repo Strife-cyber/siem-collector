@@ -52,26 +52,35 @@ impl WindowsCoordinator {
     pub async fn run(
         sender: mpsc::Sender<CollectorLogRecord>,
         bookmark_dir: Option<PathBuf>,
+        security_event_ids: Option<Vec<u32>>,
     ) -> Result<()> {
         info!("Starting {} Windows collectors", ALL_COLLECTORS.len());
 
+        // Build optional XPath filter for Security events.
+        let security_filter = security_event_ids
+            .as_ref()
+            .and_then(|ids| crate::config::build_security_filter(ids))
+            .unwrap_or_else(|| "*".to_string());
+        if security_filter != "*" {
+            info!(filter = %security_filter, "Security channel filter applied");
+        }
+
         // Build bookmark paths for each channel-based collector.
         let bookmark = |name: &str| -> Option<PathBuf> {
-            bookmark_dir.as_ref().map(|d| d.join(format!("{}.bookmark", name)))
+            bookmark_dir
+                .as_ref()
+                .map(|d| d.join(format!("{}.bookmark", name)))
         };
 
         let collectors: Vec<Box<dyn Collector>> = vec![
             Box::new(
                 WindowsEventLogCollector::new("Security")
+                    .with_filter(&security_filter)
                     .with_bookmark(bookmark("Security")),
             ),
+            Box::new(WindowsEventLogCollector::new("System").with_bookmark(bookmark("System"))),
             Box::new(
-                WindowsEventLogCollector::new("System")
-                    .with_bookmark(bookmark("System")),
-            ),
-            Box::new(
-                WindowsEventLogCollector::new("Application")
-                    .with_bookmark(bookmark("Application")),
+                WindowsEventLogCollector::new("Application").with_bookmark(bookmark("Application")),
             ),
             Box::new(WindowsFimCollector),
             Box::new(WindowsNetworkCollector),

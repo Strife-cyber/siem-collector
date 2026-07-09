@@ -76,6 +76,13 @@ impl WindowsEventLogCollector {
         self.bookmark_path = path;
         self
     }
+
+    /// Override the XPath query filter (default is `"*"` = all events).
+    /// Example: `*[System[(EventID=4624 or EventID=4625)]]`
+    pub fn with_filter(mut self, filter: impl Into<String>) -> Self {
+        self.filter = filter.into();
+        self
+    }
 }
 
 #[async_trait]
@@ -88,7 +95,14 @@ impl Collector for WindowsEventLogCollector {
         let bookmark_path = self.bookmark_path.clone();
 
         tokio::task::spawn_blocking(move || {
-            subscribe_and_collect(channel, filter, source_type, sender, hostname, bookmark_path)
+            subscribe_and_collect(
+                channel,
+                filter,
+                source_type,
+                sender,
+                hostname,
+                bookmark_path,
+            )
         })
         .await
         .map_err(|e| anyhow::anyhow!("Join error: {}", e))?
@@ -134,6 +148,21 @@ mod tests {
         assert_eq!(coll.channel, "Security");
         assert_eq!(coll.filter, "*[System[EventID=4624]]");
         assert_eq!(coll.source_type, SourceType::WindowsSecurity);
+    }
+
+    #[test]
+    fn with_filter_overrides_default() {
+        let coll = WindowsEventLogCollector::new("Security")
+            .with_filter("*[System[(EventID=4624 or EventID=4625)]]");
+        assert_eq!(coll.filter, "*[System[(EventID=4624 or EventID=4625)]]");
+    }
+
+    #[test]
+    fn with_filter_on_custom_channel() {
+        let coll = WindowsEventLogCollector::new("MyApp").with_filter("*[System[EventID=100]]");
+        assert_eq!(coll.channel, "MyApp");
+        assert_eq!(coll.filter, "*[System[EventID=100]]");
+        assert_eq!(coll.source_type, SourceType::Custom("MyApp".to_string()));
     }
 
     /// The run method spawns a blocking task; if the sender is dropped quickly,
