@@ -962,8 +962,12 @@ fn classify_windows_event(source_type: &SourceType, event_id: Option<u32>) -> (&
         Some(5154) | Some(5156) => (TAX_NETWORK_CONNECTION, "FIREWALL_ALLOW", SEV_INFO),
         // Windows Firewall with Advanced Security rule changes (audit events):
         // 2004 added, 2005 modified, 2006 deleted, 2009 changed — defense
-        // evasion signal (MITRE T1562.004) when unauthorized.
-        Some(2004) | Some(2005) | Some(2006) | Some(2009) => {
+        // evasion signal (MITRE T1562.004) when unauthorized. Gated to the
+        // network collector: the same IDs in the System log are unrelated
+        // (e.g. 2004 = Resource Exhaustion Detector).
+        Some(2004) | Some(2005) | Some(2006) | Some(2009)
+            if matches!(source_type, SourceType::WindowsNetwork) =>
+        {
             (TAX_FIREWALL_RULE, "FIREWALL_RULE_CHANGE", SEV_WARNING)
         }
         _ => {
@@ -1152,6 +1156,16 @@ mod tests {
             assert_eq!(log.event_taxonomy, TAX_FIREWALL_RULE, "event id {id}");
             assert_eq!(log.severity, SEV_WARNING, "event id {id}");
         }
+    }
+
+    #[test]
+    fn windows_system_2004_not_firewall_rule_change() {
+        // System-log event 2004 is Resource Exhaustion Detector, not a
+        // firewall rule change — must not be classified as one.
+        let xml = r#"<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event"><System><EventID>2004</EventID></System></Event>"#;
+        let rec = make_record(SourceType::WindowsSystem, xml);
+        let log = normalize_record(&rec);
+        assert_ne!(log.action, "FIREWALL_RULE_CHANGE");
     }
 
     #[test]
