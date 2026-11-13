@@ -121,9 +121,95 @@ pub fn normalize_record(record: &CollectorLogRecord) -> NormalizedLog {
             normalize_windows(&raw, &record.source_type, hostname, collected_at)
         }
 
+        // Linux auditd (execve, syscall, file access)
+        SourceType::LinuxAuditd => normalize_auditd(&raw, source_type, hostname, collected_at),
+
         // Everything else — pass through with defaults.
         _ => default_normalized(source_type, hostname, collected_at, raw),
     }
+}
+
+// ── Linux auditd parser ─────────────────────────────────────────────
+
+fn normalize_auditd(
+    raw: &str,
+    source_type: String,
+    hostname: String,
+    collected_at: String,
+) -> NormalizedLog {
+    let mut log = default_normalized(source_type, hostname, collected_at, raw.to_string());
+
+    if raw.contains("type=EXECVE") {
+        // argc=N a0="/usr/bin/foo" a1="arg1" a2="arg two" ...
+        // auditd splits long argument lists across records; only records
+        // carrying a0= start a new execution — fragments are ignored.
+        let mut args = auditd_args(raw);
+        args.sort_by_key(|(idx, _)| *idx);
+        if let Some((_, program)) = args.iter().find(|(idx, _)| *idx == 0) {
+            let command_line = args
+                .iter()
+                .map(|(_, v)| v.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            log.process_name = Some(program.clone());
+            log.command_line = Some(command_line);
+            log.event_taxonomy = TAX_PROCESS_ACTIVITY.to_string();
+            log.action = "PROCESS_EXEC".to_string();
+            log.severity = SEV_INFO;
+        }
+    } else if raw.contains("type=SYSCALL") {
+        log.event_taxonomy = TAX_SYSTEM_EVENT.to_string();
+        log.action = "SYSCALL".to_string();
+    }
+    log
+}
+
+/// Extract auditd arguments as (index, value) pairs.
+///
+/// Values are either quoted (`a0="/bin/sh"`) or hex-encoded without quotes
+/// (`a1=68656c6c6f`) when they contain non-printable characters.
+fn auditd_args(raw: &str) -> Vec<(u32, String)> {
+    let mut args = Vec::new();
+    let mut rest = raw;
+    loop {
+        let Some(pos) = rest.find(" a") else { break };
+        let tail = &rest[pos + 1..];
+        let after_a = &tail[1..];
+        let digit_len = after_a.chars().take_while(|c| c.is_ascii_digit()).count();
+        if digit_len == 0 {
+            rest = &tail[1..];
+            continue;
+        }
+        let Ok(idx) = after_a[..digit_len].parse::<u32>() else {
+            rest = &tail[1..];
+            continue;
+        };
+        let after_digits = &after_a[digit_len..];
+        if let Some(stripped) = after_digits.strip_prefix("=\"") {
+            let Some(end) = stripped.find('"') else { break };
+            args.push((idx, stripped[..end].to_string()));
+            rest = &stripped[end + 1..];
+        } else if after_digits.starts_with('=') {
+            let hex_start = &after_digits[1..];
+            let end = hex_start
+                .find(char::is_whitespace)
+                .unwrap_or(hex_start.len());
+            let hex = &hex_start[..end];
+            if hex.len() >= 2 && hex.len() % 2 == 0 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                let bytes: Vec<u8> = (0..hex.len())
+                    .step_by(2)
+                    .filter_map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+                    .collect();
+                args.push((idx, String::from_utf8_lossy(&bytes).into_owned()));
+                rest = &hex_start[end..];
+            } else {
+                rest = &tail[1..];
+            }
+        } else {
+            rest = &tail[1..];
+        }
+    }
+    args
 }
 
 // ── Default (catch-all) ──────────────────────────────────────────────
@@ -847,5 +933,50 @@ mod tests {
         assert_eq!(access_mask_operation("0x1"), Some("read".into()));
         assert_eq!(access_mask_operation("0x10000"), Some("delete".into()));
         assert_eq!(access_mask_operation("garbage"), None);
+    }
+
+    #[test]
+    fn auditd_execve_hex_arg_decoded() {
+        let raw = r#"type=EXECVE msg=audit(1699999999.123:457): argc=2 a0="/usr/bin/printf" a1=68656c6c6f20776f726c64"#;
+        let rec = make_record(SourceType::LinuxAuditd, raw);
+        let log = normalize_record(&rec);
+        assert_eq!(log.process_name.as_deref(), Some("/usr/bin/printf"));
+        assert_eq!(
+            log.command_line.as_deref(),
+            Some("/usr/bin/printf hello world")
+        );
+    }
+
+    #[test]
+    fn auditd_execve_trailing_newline_hex_arg_decoded() {
+        // Live tailer preserves the trailing newline; the hex scan must stop at it.
+        let raw = "type=EXECVE msg=audit(1699999999.123:459): argc=2 a0=2f62696e2f7368 a1=2d69\n";
+        let rec = make_record(SourceType::LinuxAuditd, raw);
+        let log = normalize_record(&rec);
+        assert_eq!(log.process_name.as_deref(), Some("/bin/sh"));
+        assert_eq!(log.command_line.as_deref(), Some("/bin/sh -i"));
+        assert_eq!(log.action, "PROCESS_EXEC");
+    }
+
+    #[test]
+    fn auditd_execve_fragment_without_a0_is_not_a_process() {
+        let raw = r#"type=EXECVE msg=audit(1699999999.123:458): a5="continued-arg""#;
+        let rec = make_record(SourceType::LinuxAuditd, raw);
+        let log = normalize_record(&rec);
+        assert_eq!(log.process_name, None);
+        assert_eq!(log.command_line, None);
+    }
+
+    #[test]
+    fn auditd_execve_extracts_process_and_command_line() {
+        let raw = r#"type=EXECVE msg=audit(1699999999.123:456): argc=3 a0="/bin/sh" a1="-c" a2="rm -rf /tmp/x""#;
+        let rec = make_record(SourceType::LinuxAuditd, raw);
+        let log = normalize_record(&rec);
+        assert_eq!(log.process_name.as_deref(), Some("/bin/sh"));
+        assert_eq!(
+            log.command_line.as_deref(),
+            Some("/bin/sh -c rm -rf /tmp/x")
+        );
+        assert_eq!(log.action, "PROCESS_EXEC");
     }
 }
