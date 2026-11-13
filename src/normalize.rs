@@ -108,8 +108,10 @@ pub fn normalize_record(record: &CollectorLogRecord) -> NormalizedLog {
             normalize_web_error(&raw, source_type, hostname, collected_at)
         }
 
-        // Firewall
-        SourceType::Firewall => normalize_firewall(&raw, source_type, hostname, collected_at),
+        // Firewall — pfSense syslog also carries resolver (unbound) lines,
+        // so try DNS extraction before the firewall normalizer.
+        SourceType::Firewall => normalize_dns(&raw, &source_type, &hostname, &collected_at)
+            .unwrap_or_else(|| normalize_firewall(&raw, source_type, hostname, collected_at)),
 
         // Windows events
         SourceType::WindowsSecurity
@@ -330,11 +332,19 @@ fn parse_dns_line(raw: &str) -> Option<(String, String, bool)> {
     // dnsmasq: "dnsmasq[1234]: query[A] www.example.com from 192.168.1.10"
     //          "dnsmasq[1234]: reply www.example.com is 93.184.216.34"
     //          "dnsmasq[1234]: cached www.example.com is ..."
-    if raw.contains("dnsmasq[") {
+    // matches both "dnsmasq[pid]: ..." syslog lines and systemd-journal
+    // JSON envelopes with SYSLOG_IDENTIFIER=dnsmasq
+    if raw.contains("dnsmasq") {
         if let Some(rest) = raw.split("query[").nth(1) {
             let after = rest.split(']').nth(1)?.trim_start();
             let (domain, ip) = after.split_once(" from ")?;
-            let ip = ip.split_whitespace().next().unwrap_or("").to_string();
+            // syslog lines end the IP at whitespace; journal JSON envelopes
+            // end it at a quote/comma/brace
+            let ip = ip
+                .split(|c: char| c.is_whitespace() || c == '"' || c == ',' || c == '}')
+                .next()
+                .unwrap_or("")
+                .to_string();
             return valid_domain(domain).map(|d| (d, ip, false));
         }
         for prefix in ["reply ", "cached "] {
@@ -359,7 +369,22 @@ fn parse_dns_line(raw: &str) -> Option<(String, String, bool)> {
         ) {
             return None;
         }
-        return valid_domain(domain).map(|d| (d, ip, false));
+        // unbound log-replies appends a response code after the query prefix
+        let is_response = tokens.any(|t| {
+            matches!(
+                t,
+                "NOERROR"
+                    | "NXDOMAIN"
+                    | "SERVFAIL"
+                    | "REFUSED"
+                    | "NOTIMP"
+                    | "YXDOMAIN"
+                    | "NXRRSET"
+                    | "NOTAUTH"
+                    | "BADVERS"
+            )
+        });
+        return valid_domain(domain).map(|d| (d, ip, is_response));
     }
     None
 }
@@ -1210,6 +1235,35 @@ mod tests {
         let log = normalize_record(&rec);
         assert_eq!(log.action, "DNS_RESPONSE");
         assert_eq!(log.domain.as_deref(), Some("www.example.com"));
+    }
+
+    #[test]
+    fn pfsense_firewall_source_unbound_query_extracts_domain() {
+        let raw = r#"unbound: [12345:0] info: 192.168.1.5 tunnel.evil-corp.com. A IN"#;
+        let rec = make_record(SourceType::Firewall, raw);
+        let log = normalize_record(&rec);
+        assert_eq!(log.action, "DNS_QUERY");
+        assert_eq!(log.domain.as_deref(), Some("tunnel.evil-corp.com"));
+        assert_eq!(log.source_ip, "192.168.1.5");
+    }
+
+    #[test]
+    fn unbound_reply_with_rcode_is_response() {
+        let raw = r#"unbound: [12345:0] info: 192.168.1.5 www.example.com. A IN NOERROR"#;
+        let rec = make_record(SourceType::LinuxSyslog, raw);
+        let log = normalize_record(&rec);
+        assert_eq!(log.action, "DNS_RESPONSE");
+        assert_eq!(log.domain.as_deref(), Some("www.example.com"));
+    }
+
+    #[test]
+    fn dnsmasq_journal_envelope_extracts_domain() {
+        let raw = r#"{"MESSAGE":"dnsmasq[1234]: query[A] cdn.example.com from 10.0.0.8","SYSLOG_IDENTIFIER":"dnsmasq"}"#;
+        let rec = make_record(SourceType::LinuxSyslog, raw);
+        let log = normalize_record(&rec);
+        assert_eq!(log.action, "DNS_QUERY");
+        assert_eq!(log.domain.as_deref(), Some("cdn.example.com"));
+        assert_eq!(log.source_ip, "10.0.0.8");
     }
 
     #[test]
