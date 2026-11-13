@@ -160,8 +160,46 @@ fn normalize_auditd(
     } else if raw.contains("type=SYSCALL") {
         log.event_taxonomy = TAX_SYSTEM_EVENT.to_string();
         log.action = "SYSCALL".to_string();
+    } else if raw.contains("type=PATH") {
+        // PATH records accompany syscalls on watched paths:
+        //   item=0 name="/home/u/.ssh/authorized_keys" nametype=CREATE mode=0100644 ...
+        if let Some(name) = auditd_quoted_field(raw, "name") {
+            log.event_taxonomy = TAX_FILE_ACCESS.to_string();
+            log.action = "FILE_ACCESS".to_string();
+            log.file_path = Some(name);
+            log.file_operation = Some(auditd_path_operation(raw));
+            log.severity = SEV_INFO;
+        }
     }
     log
+}
+
+/// Extract a quoted auditd field value, e.g. `name="/etc/passwd"`.
+fn auditd_quoted_field(raw: &str, key: &str) -> Option<String> {
+    let pat = format!("{}=\"", key);
+    let start = raw.find(&pat)? + pat.len();
+    let end = raw[start..].find('"')? + start;
+    Some(raw[start..end].to_string())
+}
+
+/// Extract an unquoted auditd token, e.g. `nametype=CREATE`.
+fn auditd_token(raw: &str, key: &str) -> Option<String> {
+    let pat = format!("{}=", key);
+    let start = raw.find(&pat)? + pat.len();
+    let rest = &raw[start..];
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    Some(rest[..end].to_string())
+}
+
+/// Map auditd PATH `nametype` to a coarse file operation.
+fn auditd_path_operation(raw: &str) -> String {
+    match auditd_token(raw, "nametype").as_deref() {
+        Some("DELETE") => "delete",
+        Some("CREATE") => "create",
+        Some("RENAME") | Some("RENAME_UPDATE") => "rename",
+        _ => "modify",
+    }
+    .to_string()
 }
 
 /// Extract auditd arguments as (index, value) pairs.
@@ -965,6 +1003,29 @@ mod tests {
         let log = normalize_record(&rec);
         assert_eq!(log.process_name, None);
         assert_eq!(log.command_line, None);
+    }
+
+    #[test]
+    fn auditd_path_record_extracts_file_access() {
+        let raw = r#"type=PATH msg=audit(1699999999.123:460): item=0 name="/home/admin/.ssh/authorized_keys" nametype=CREATE mode=0100600 ouid=1000 ogid=1000 rdev=00:00"#;
+        let rec = make_record(SourceType::LinuxAuditd, raw);
+        let log = normalize_record(&rec);
+        assert_eq!(log.action, "FILE_ACCESS");
+        assert_eq!(
+            log.file_path.as_deref(),
+            Some("/home/admin/.ssh/authorized_keys")
+        );
+        assert_eq!(log.file_operation.as_deref(), Some("create"));
+        assert_eq!(log.event_taxonomy, TAX_FILE_ACCESS);
+    }
+
+    #[test]
+    fn auditd_path_record_delete_maps_operation() {
+        let raw = r#"type=PATH msg=audit(1699999999.124:461): item=1 name="/var/log/auth.log" nametype=DELETE"#;
+        let rec = make_record(SourceType::LinuxAuditd, raw);
+        let log = normalize_record(&rec);
+        assert_eq!(log.file_operation.as_deref(), Some("delete"));
+        assert_eq!(log.file_path.as_deref(), Some("/var/log/auth.log"));
     }
 
     #[test]
