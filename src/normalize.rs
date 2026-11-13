@@ -56,6 +56,9 @@ pub struct NormalizedLog {
     pub file_operation: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
 }
 
@@ -124,8 +127,10 @@ pub fn normalize_record(record: &CollectorLogRecord) -> NormalizedLog {
         // Linux auditd (execve, syscall, file access)
         SourceType::LinuxAuditd => normalize_auditd(&raw, source_type, hostname, collected_at),
 
-        // Everything else — pass through with defaults.
-        _ => default_normalized(source_type, hostname, collected_at, raw),
+        // Everything else — DNS resolver lines get domain extraction,
+        // everything else passes through with defaults.
+        _ => normalize_dns(&raw, &source_type, &hostname, &collected_at)
+            .unwrap_or_else(|| default_normalized(source_type, hostname, collected_at, raw)),
     }
 }
 
@@ -289,6 +294,91 @@ fn auditd_args(raw: &str) -> Vec<(u32, String)> {
     args
 }
 
+// ── DNS resolver parser (dnsmasq, unbound/pfSense) ──────────────────
+
+/// Recognize DNS query/reply lines from common resolvers and extract the
+/// queried domain. Returns None for anything else.
+fn normalize_dns(
+    raw: &str,
+    source_type: &str,
+    hostname: &str,
+    collected_at: &str,
+) -> Option<NormalizedLog> {
+    let (domain, source_ip, is_response) = parse_dns_line(raw)?;
+    let mut log = default_normalized(
+        source_type.to_string(),
+        hostname.to_string(),
+        collected_at.to_string(),
+        raw.to_string(),
+    );
+    log.domain = Some(domain);
+    if !source_ip.is_empty() {
+        log.source_ip = source_ip;
+    }
+    log.event_taxonomy = TAX_NETWORK_CONNECTION.to_string();
+    log.action = if is_response {
+        "DNS_RESPONSE"
+    } else {
+        "DNS_QUERY"
+    }
+    .to_string();
+    log.severity = SEV_INFO;
+    Some(log)
+}
+
+fn parse_dns_line(raw: &str) -> Option<(String, String, bool)> {
+    // dnsmasq: "dnsmasq[1234]: query[A] www.example.com from 192.168.1.10"
+    //          "dnsmasq[1234]: reply www.example.com is 93.184.216.34"
+    //          "dnsmasq[1234]: cached www.example.com is ..."
+    if raw.contains("dnsmasq[") {
+        if let Some(rest) = raw.split("query[").nth(1) {
+            let after = rest.split(']').nth(1)?.trim_start();
+            let (domain, ip) = after.split_once(" from ")?;
+            let ip = ip.split_whitespace().next().unwrap_or("").to_string();
+            return valid_domain(domain).map(|d| (d, ip, false));
+        }
+        for prefix in ["reply ", "cached "] {
+            if let Some(idx) = raw.find(prefix) {
+                let rest = &raw[idx + prefix.len()..];
+                let domain = rest.split(" is ").next()?;
+                return valid_domain(domain).map(|d| (d, String::new(), true));
+            }
+        }
+        return None;
+    }
+    // unbound (pfSense): "unbound: [1234:0] info: 192.168.1.5 www.example.com. A IN"
+    if raw.contains("unbound") && raw.contains(" info: ") {
+        let rest = raw.split(" info: ").nth(1)?;
+        let mut tokens = rest.split_whitespace();
+        let ip = tokens.next()?.to_string();
+        let domain = tokens.next()?.trim_end_matches('.');
+        let qtype = tokens.next().unwrap_or("");
+        if !matches!(
+            qtype,
+            "A" | "AAAA" | "PTR" | "TXT" | "MX" | "NS" | "SOA" | "ANY" | "CNAME" | "HTTPS" | "SVCB"
+        ) {
+            return None;
+        }
+        return valid_domain(domain).map(|d| (d, ip, false));
+    }
+    None
+}
+
+/// Accept only plausible DNS names (labels of [a-z0-9._-], one dot minimum).
+fn valid_domain(d: &str) -> Option<String> {
+    let d = d.trim().trim_end_matches('.');
+    if d.len() < 4 || d.len() > 253 || !d.contains('.') {
+        return None;
+    }
+    if !d
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+    {
+        return None;
+    }
+    Some(d.to_lowercase())
+}
+
 // ── Default (catch-all) ──────────────────────────────────────────────
 
 fn default_normalized(
@@ -316,6 +406,7 @@ fn default_normalized(
         command_line: None,
         file_path: None,
         file_operation: None,
+        domain: None,
         tags: None,
     }
 }
@@ -390,6 +481,7 @@ fn normalize_auth(
         command_line: None,
         file_path: None,
         file_operation: None,
+        domain: None,
         tags: None,
     }
 }
@@ -447,6 +539,7 @@ fn normalize_web_access(
         command_line: None,
         file_path: None,
         file_operation: None,
+        domain: None,
         tags,
     }
 }
@@ -490,6 +583,7 @@ fn normalize_web_error(
         command_line: None,
         file_path: None,
         file_operation: None,
+        domain: None,
         tags: None,
     }
 }
@@ -541,6 +635,7 @@ fn normalize_firewall(
         command_line: None,
         file_path: None,
         file_operation: None,
+        domain: None,
         tags,
     }
 }
@@ -578,6 +673,7 @@ fn normalize_windows(
         command_line,
         file_path,
         file_operation,
+        domain: None,
         tags: event_id.map(|id| vec![format!("EventID={}", id)]),
     }
 }
@@ -1084,6 +1180,44 @@ mod tests {
         let log = normalize_record(&rec);
         assert_eq!(log.file_operation.as_deref(), Some("delete"));
         assert_eq!(log.file_path.as_deref(), Some("/var/log/auth.log"));
+    }
+
+    #[test]
+    fn dnsmasq_query_extracts_domain_and_client() {
+        let raw =
+            r#"Nov 12 09:00:01 srv dnsmasq[1234]: query[A] www.example.com from 192.168.1.10"#;
+        let rec = make_record(SourceType::LinuxSyslog, raw);
+        let log = normalize_record(&rec);
+        assert_eq!(log.action, "DNS_QUERY");
+        assert_eq!(log.domain.as_deref(), Some("www.example.com"));
+        assert_eq!(log.source_ip, "192.168.1.10");
+    }
+
+    #[test]
+    fn unbound_info_line_extracts_domain() {
+        let raw = r#"unbound: [12345:0] info: 192.168.1.5 Exfil.Evil-Corp.com. A IN"#;
+        let rec = make_record(SourceType::LinuxSyslog, raw);
+        let log = normalize_record(&rec);
+        assert_eq!(log.action, "DNS_QUERY");
+        assert_eq!(log.domain.as_deref(), Some("exfil.evil-corp.com"));
+        assert_eq!(log.source_ip, "192.168.1.5");
+    }
+
+    #[test]
+    fn dnsmasq_reply_is_response() {
+        let raw = r#"Nov 12 09:00:02 srv dnsmasq[1234]: reply www.example.com is 93.184.216.34"#;
+        let rec = make_record(SourceType::LinuxSyslog, raw);
+        let log = normalize_record(&rec);
+        assert_eq!(log.action, "DNS_RESPONSE");
+        assert_eq!(log.domain.as_deref(), Some("www.example.com"));
+    }
+
+    #[test]
+    fn non_dns_syslog_line_has_no_domain() {
+        let raw = r#"Nov 12 09:00:03 srv cron[99]: (root) CMD (run-parts /etc/cron.hourly)"#;
+        let rec = make_record(SourceType::LinuxSyslog, raw);
+        let log = normalize_record(&rec);
+        assert_eq!(log.domain, None);
     }
 
     #[test]
