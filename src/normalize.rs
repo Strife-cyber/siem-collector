@@ -191,7 +191,9 @@ fn auditd_args(raw: &str) -> Vec<(u32, String)> {
             rest = &stripped[end + 1..];
         } else if after_digits.starts_with('=') {
             let hex_start = &after_digits[1..];
-            let end = hex_start.find(' ').unwrap_or(hex_start.len());
+            let end = hex_start
+                .find(char::is_whitespace)
+                .unwrap_or(hex_start.len());
             let hex = &hex_start[..end];
             if hex.len() >= 2 && hex.len() % 2 == 0 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
                 let bytes: Vec<u8> = (0..hex.len())
@@ -943,6 +945,17 @@ mod tests {
             log.command_line.as_deref(),
             Some("/usr/bin/printf hello world")
         );
+    }
+
+    #[test]
+    fn auditd_execve_trailing_newline_hex_arg_decoded() {
+        // Live tailer preserves the trailing newline; the hex scan must stop at it.
+        let raw = "type=EXECVE msg=audit(1699999999.123:459): argc=2 a0=2f62696e2f7368 a1=2d69\n";
+        let rec = make_record(SourceType::LinuxAuditd, raw);
+        let log = normalize_record(&rec);
+        assert_eq!(log.process_name.as_deref(), Some("/bin/sh"));
+        assert_eq!(log.command_line.as_deref(), Some("/bin/sh -i"));
+        assert_eq!(log.action, "PROCESS_EXEC");
     }
 
     #[test]
