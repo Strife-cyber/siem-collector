@@ -6,6 +6,7 @@
 
 pub mod config;
 pub mod coordinator;
+pub mod flow;
 pub mod logs;
 pub mod normalize;
 pub mod shipper;
