@@ -354,7 +354,8 @@ fn parse_dns_line(raw: &str) -> Option<(String, String, bool)> {
                 return valid_domain(domain).map(|d| (d, String::new(), true));
             }
         }
-        return None;
+        // no dnsmasq pattern matched — fall through so unbound lines that
+        // merely mention "dnsmasq" (e.g. dnsmasq.example.com) still parse
     }
     // unbound (pfSense): "unbound: [1234:0] info: 192.168.1.5 www.example.com. A IN"
     if raw.contains("unbound") && raw.contains(" info: ") {
@@ -1264,6 +1265,15 @@ mod tests {
         assert_eq!(log.action, "DNS_QUERY");
         assert_eq!(log.domain.as_deref(), Some("cdn.example.com"));
         assert_eq!(log.source_ip, "10.0.0.8");
+    }
+
+    #[test]
+    fn unbound_query_for_dnsmasq_named_domain_still_parses() {
+        let raw = r#"unbound: [12345:0] info: 192.168.1.9 dnsmasq.example.com. A IN"#;
+        let rec = make_record(SourceType::LinuxSyslog, raw);
+        let log = normalize_record(&rec);
+        assert_eq!(log.action, "DNS_QUERY");
+        assert_eq!(log.domain.as_deref(), Some("dnsmasq.example.com"));
     }
 
     #[test]
