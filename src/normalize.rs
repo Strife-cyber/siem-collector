@@ -121,9 +121,65 @@ pub fn normalize_record(record: &CollectorLogRecord) -> NormalizedLog {
             normalize_windows(&raw, &record.source_type, hostname, collected_at)
         }
 
+        // Linux auditd (execve, syscall, file access)
+        SourceType::LinuxAuditd => normalize_auditd(&raw, source_type, hostname, collected_at),
+
         // Everything else — pass through with defaults.
         _ => default_normalized(source_type, hostname, collected_at, raw),
     }
+}
+
+// ── Linux auditd parser ─────────────────────────────────────────────
+
+fn normalize_auditd(
+    raw: &str,
+    source_type: String,
+    hostname: String,
+    collected_at: String,
+) -> NormalizedLog {
+    let mut log = default_normalized(source_type, hostname, collected_at, raw.to_string());
+
+    if raw.contains("type=EXECVE") {
+        // argc=N a0="/usr/bin/foo" a1="arg1" a2="arg two" ...
+        let args: Vec<String> = auditd_args(raw);
+        if !args.is_empty() {
+            log.process_name = Some(args[0].clone());
+            log.command_line = Some(args.join(" "));
+            log.event_taxonomy = TAX_PROCESS_ACTIVITY.to_string();
+            log.action = "PROCESS_EXEC".to_string();
+            log.severity = SEV_INFO;
+        }
+    } else if raw.contains("type=SYSCALL") {
+        log.event_taxonomy = TAX_SYSTEM_EVENT.to_string();
+        log.action = "SYSCALL".to_string();
+    }
+    log
+}
+
+/// Extract quoted auditd arguments (a0=, a1=, ...) in order.
+fn auditd_args(raw: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut rest = raw;
+    loop {
+        let Some(pos) = rest.find(" a") else { break };
+        let tail = &rest[pos + 1..];
+        let after_a = &tail[1..];
+        let digit_len = after_a.chars().take_while(|c| c.is_ascii_digit()).count();
+        if digit_len == 0 {
+            rest = &tail[1..];
+            continue;
+        }
+        let after_digits = &after_a[digit_len..];
+        if !after_digits.starts_with("=\"") {
+            rest = &tail[1..];
+            continue;
+        }
+        let value = &after_digits[2..];
+        let Some(end) = value.find('"') else { break };
+        args.push(value[..end].to_string());
+        rest = &value[end + 1..];
+    }
+    args
 }
 
 // ── Default (catch-all) ──────────────────────────────────────────────
@@ -847,5 +903,18 @@ mod tests {
         assert_eq!(access_mask_operation("0x1"), Some("read".into()));
         assert_eq!(access_mask_operation("0x10000"), Some("delete".into()));
         assert_eq!(access_mask_operation("garbage"), None);
+    }
+
+    #[test]
+    fn auditd_execve_extracts_process_and_command_line() {
+        let raw = r#"type=EXECVE msg=audit(1699999999.123:456): argc=3 a0="/bin/sh" a1="-c" a2="rm -rf /tmp/x""#;
+        let rec = make_record(SourceType::LinuxAuditd, raw);
+        let log = normalize_record(&rec);
+        assert_eq!(log.process_name.as_deref(), Some("/bin/sh"));
+        assert_eq!(
+            log.command_line.as_deref(),
+            Some("/bin/sh -c rm -rf /tmp/x")
+        );
+        assert_eq!(log.action, "PROCESS_EXEC");
     }
 }
