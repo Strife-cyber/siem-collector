@@ -22,12 +22,13 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 
-use crate::types::CollectorLogRecord;
+use crate::types::{CollectorLogRecord, SourceType};
 
 const FLOW_ACTION: &str = "FLOW_BYTES";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct FlowKey {
+    host: String,
     src: String,
     dst: String,
     sport: u16,
@@ -79,19 +80,21 @@ impl FlowAggregator {
 
     /// Feed one collector record; returns any expired flow summaries.
     pub fn ingest(&mut self, record: &CollectorLogRecord) -> Vec<serde_json::Value> {
-        if !self.enabled {
-            return Vec::new();
+        let now = Utc::now();
+        let mut out = Vec::new();
+        if self.enabled {
+            self.sweep(now, &mut out);
+        }
+        if !self.enabled || record.source_type != SourceType::Firewall {
+            return out;
         }
         let raw = String::from_utf8_lossy(&record.raw_bytes);
         let Some(pkt) = parse_filterlog_flow(&raw) else {
-            return Vec::new();
+            return out;
         };
 
-        let now = Utc::now();
-        let mut out = Vec::new();
-        self.sweep(now, &mut out);
-
         let key = FlowKey {
+            host: record.hostname.clone(),
             src: pkt.src,
             dst: pkt.dst,
             sport: pkt.sport,
@@ -165,17 +168,26 @@ impl FlowAggregator {
             .flows
             .iter()
             .filter(|(_, s)| {
-                s.bytes >= min_bytes
-                    && now
-                        .signed_duration_since(s.started)
-                        .to_std()
-                        .unwrap_or_default()
-                        >= window
+                now.signed_duration_since(s.started)
+                    .to_std()
+                    .unwrap_or_default()
+                    >= window
             })
             .map(|(k, _)| k.clone())
             .collect();
         for k in expired {
-            out.push(self.take(&k, now));
+            // Drop expired windows below the byte threshold instead of
+            // retaining them (memory bound) — bytes never carry across windows.
+            if self
+                .flows
+                .get(&k)
+                .map(|s| s.bytes >= min_bytes)
+                .unwrap_or(false)
+            {
+                out.push(self.take(&k, now));
+            } else {
+                self.flows.remove(&k);
+            }
         }
     }
 
