@@ -163,7 +163,7 @@ fn normalize_auditd(
     } else if raw.contains("type=PATH") {
         // PATH records accompany syscalls on watched paths:
         //   item=0 name="/home/u/.ssh/authorized_keys" nametype=CREATE mode=0100644 ...
-        if let Some(name) = auditd_quoted_field(raw, "name") {
+        if let Some(name) = auditd_name_field(raw) {
             log.event_taxonomy = TAX_FILE_ACCESS.to_string();
             log.action = "FILE_ACCESS".to_string();
             log.file_path = Some(name);
@@ -182,6 +182,40 @@ fn auditd_quoted_field(raw: &str, key: &str) -> Option<String> {
     Some(raw[start..end].to_string())
 }
 
+/// Extract the PATH `name=` field: quoted plain text, or hex-encoded when
+/// the filename contains spaces/quotes/non-ASCII bytes.
+fn auditd_name_field(raw: &str) -> Option<String> {
+    if let Some(quoted) = auditd_quoted_field(raw, "name") {
+        return Some(quoted);
+    }
+    let pat = "name=";
+    let start = raw.find(pat)? + pat.len();
+    let rest = &raw[start..];
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let hex = &rest[..end];
+    if hex.len() >= 2 && hex.len() % 2 == 0 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .filter_map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+            .collect();
+        return Some(String::from_utf8_lossy(&bytes).into_owned());
+    }
+    None
+}
+
+/// Byte offset just past the first PATH `name=` value (quoted or hex).
+fn auditd_name_field_end(raw: &str) -> Option<usize> {
+    let pat = "name=";
+    let start = raw.find(pat)? + pat.len();
+    let rest = &raw[start..];
+    if rest.starts_with('"') {
+        let end = rest[1..].find('"')? + 1;
+        return Some(start + end + 1);
+    }
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    Some(start + end)
+}
+
 /// Extract an unquoted auditd token, e.g. `nametype=CREATE`.
 fn auditd_token(raw: &str, key: &str) -> Option<String> {
     let pat = format!("{}=", key);
@@ -193,7 +227,12 @@ fn auditd_token(raw: &str, key: &str) -> Option<String> {
 
 /// Map auditd PATH `nametype` to a coarse file operation.
 fn auditd_path_operation(raw: &str) -> String {
-    match auditd_token(raw, "nametype").as_deref() {
+    // The first name= field's closing quote bounds where its item ends;
+    // search for nametype after it so filenames containing "nametype="
+    // (e.g. /tmp/nametype=example) are not mistaken for the field.
+    let search_from = auditd_name_field_end(raw).unwrap_or(0);
+    let haystack = &raw[search_from..];
+    match auditd_token(haystack, "nametype").as_deref() {
         Some("DELETE") => "delete",
         Some("CREATE") => "create",
         Some("RENAME") | Some("RENAME_UPDATE") => "rename",
@@ -1017,6 +1056,25 @@ mod tests {
         );
         assert_eq!(log.file_operation.as_deref(), Some("create"));
         assert_eq!(log.event_taxonomy, TAX_FILE_ACCESS);
+    }
+
+    #[test]
+    fn auditd_path_record_hex_name_decoded() {
+        // auditd hex-encodes names with spaces/quotes/non-ASCII bytes
+        let raw = "type=PATH msg=audit(1699999999.125:462): item=0 name=2f686f6d652f757365722f6d792066696c65 nametype=CREATE";
+        let rec = make_record(SourceType::LinuxAuditd, raw);
+        let log = normalize_record(&rec);
+        assert_eq!(log.file_path.as_deref(), Some("/home/user/my file"));
+        assert_eq!(log.file_operation.as_deref(), Some("create"));
+    }
+
+    #[test]
+    fn auditd_path_record_nametype_inside_filename_ignored() {
+        let raw = r#"type=PATH msg=audit(1699999999.126:463): item=0 name="/tmp/nametype=example" nametype=DELETE"#;
+        let rec = make_record(SourceType::LinuxAuditd, raw);
+        let log = normalize_record(&rec);
+        assert_eq!(log.file_path.as_deref(), Some("/tmp/nametype=example"));
+        assert_eq!(log.file_operation.as_deref(), Some("delete"));
     }
 
     #[test]
