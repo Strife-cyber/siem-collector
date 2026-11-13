@@ -21,6 +21,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tracing::{info, warn};
 
+use crate::flow::FlowAggregator;
 use crate::normalize::normalize_record;
 use crate::types::CollectorLogRecord;
 
@@ -76,15 +77,22 @@ pub async fn run_shipper(
     );
 
     let mut batch: Vec<serde_json::Value> = Vec::with_capacity(config.batch_size);
+    let mut flow_agg = FlowAggregator::from_env();
 
     loop {
         // ── Wait for at least one record ────────────────────────────
         match rx.recv().await {
             Some(record) => {
+                for v in flow_agg.ingest(&record) {
+                    batch.push(v);
+                }
                 let normalized = normalize_record(&record);
                 batch.push(serde_json::to_value(&normalized)?);
             }
             None => {
+                for v in flow_agg.flush_all() {
+                    batch.push(v);
+                }
                 if !batch.is_empty() {
                     send_batch_with_retry(&client, &config, &batch).await?;
                 }
@@ -103,6 +111,9 @@ pub async fn run_shipper(
                 result = rx.recv() => {
                     match result {
                         Some(record) => {
+                            for v in flow_agg.ingest(&record) {
+                                batch.push(v);
+                            }
                             let normalized = normalize_record(&record);
                             batch.push(serde_json::to_value(&normalized)?);
                             if batch.len() >= config.batch_size {
@@ -110,6 +121,9 @@ pub async fn run_shipper(
                             }
                         }
                         None => {
+                            for v in flow_agg.flush_all() {
+                                batch.push(v);
+                            }
                             if !batch.is_empty() {
                                 send_batch_with_retry(&client, &config, &batch).await?;
                             }
