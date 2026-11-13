@@ -141,10 +141,18 @@ fn normalize_auditd(
 
     if raw.contains("type=EXECVE") {
         // argc=N a0="/usr/bin/foo" a1="arg1" a2="arg two" ...
-        let args: Vec<String> = auditd_args(raw);
-        if !args.is_empty() {
-            log.process_name = Some(args[0].clone());
-            log.command_line = Some(args.join(" "));
+        // auditd splits long argument lists across records; only records
+        // carrying a0= start a new execution — fragments are ignored.
+        let mut args = auditd_args(raw);
+        args.sort_by_key(|(idx, _)| *idx);
+        if let Some((_, program)) = args.iter().find(|(idx, _)| *idx == 0) {
+            let command_line = args
+                .iter()
+                .map(|(_, v)| v.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            log.process_name = Some(program.clone());
+            log.command_line = Some(command_line);
             log.event_taxonomy = TAX_PROCESS_ACTIVITY.to_string();
             log.action = "PROCESS_EXEC".to_string();
             log.severity = SEV_INFO;
@@ -156,8 +164,11 @@ fn normalize_auditd(
     log
 }
 
-/// Extract quoted auditd arguments (a0=, a1=, ...) in order.
-fn auditd_args(raw: &str) -> Vec<String> {
+/// Extract auditd arguments as (index, value) pairs.
+///
+/// Values are either quoted (`a0="/bin/sh"`) or hex-encoded without quotes
+/// (`a1=68656c6c6f`) when they contain non-printable characters.
+fn auditd_args(raw: &str) -> Vec<(u32, String)> {
     let mut args = Vec::new();
     let mut rest = raw;
     loop {
@@ -169,15 +180,32 @@ fn auditd_args(raw: &str) -> Vec<String> {
             rest = &tail[1..];
             continue;
         }
-        let after_digits = &after_a[digit_len..];
-        if !after_digits.starts_with("=\"") {
+        let Ok(idx) = after_a[..digit_len].parse::<u32>() else {
             rest = &tail[1..];
             continue;
+        };
+        let after_digits = &after_a[digit_len..];
+        if let Some(stripped) = after_digits.strip_prefix("=\"") {
+            let Some(end) = stripped.find('"') else { break };
+            args.push((idx, stripped[..end].to_string()));
+            rest = &stripped[end + 1..];
+        } else if after_digits.starts_with('=') {
+            let hex_start = &after_digits[1..];
+            let end = hex_start.find(' ').unwrap_or(hex_start.len());
+            let hex = &hex_start[..end];
+            if hex.len() >= 2 && hex.len() % 2 == 0 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                let bytes: Vec<u8> = (0..hex.len())
+                    .step_by(2)
+                    .filter_map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+                    .collect();
+                args.push((idx, String::from_utf8_lossy(&bytes).into_owned()));
+                rest = &hex_start[end..];
+            } else {
+                rest = &tail[1..];
+            }
+        } else {
+            rest = &tail[1..];
         }
-        let value = &after_digits[2..];
-        let Some(end) = value.find('"') else { break };
-        args.push(value[..end].to_string());
-        rest = &value[end + 1..];
     }
     args
 }
@@ -903,6 +931,27 @@ mod tests {
         assert_eq!(access_mask_operation("0x1"), Some("read".into()));
         assert_eq!(access_mask_operation("0x10000"), Some("delete".into()));
         assert_eq!(access_mask_operation("garbage"), None);
+    }
+
+    #[test]
+    fn auditd_execve_hex_arg_decoded() {
+        let raw = r#"type=EXECVE msg=audit(1699999999.123:457): argc=2 a0="/usr/bin/printf" a1=68656c6c6f20776f726c64"#;
+        let rec = make_record(SourceType::LinuxAuditd, raw);
+        let log = normalize_record(&rec);
+        assert_eq!(log.process_name.as_deref(), Some("/usr/bin/printf"));
+        assert_eq!(
+            log.command_line.as_deref(),
+            Some("/usr/bin/printf hello world")
+        );
+    }
+
+    #[test]
+    fn auditd_execve_fragment_without_a0_is_not_a_process() {
+        let raw = r#"type=EXECVE msg=audit(1699999999.123:458): a5="continued-arg""#;
+        let rec = make_record(SourceType::LinuxAuditd, raw);
+        let log = normalize_record(&rec);
+        assert_eq!(log.process_name, None);
+        assert_eq!(log.command_line, None);
     }
 
     #[test]
