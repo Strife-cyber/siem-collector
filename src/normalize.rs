@@ -44,6 +44,18 @@ pub struct NormalizedLog {
     pub raw_message: String,
 
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_name: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_line: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_operation: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
 }
 
@@ -137,6 +149,10 @@ fn default_normalized(
         outcome: None,
         severity: SEV_INFO,
         raw_message,
+        process_name: None,
+        command_line: None,
+        file_path: None,
+        file_operation: None,
         tags: None,
     }
 }
@@ -207,6 +223,10 @@ fn normalize_auth(
         outcome: outcome.map(|s| s.to_string()),
         severity,
         raw_message: raw.to_string(),
+        process_name: None,
+        command_line: None,
+        file_path: None,
+        file_operation: None,
         tags: None,
     }
 }
@@ -260,6 +280,10 @@ fn normalize_web_access(
         outcome: outcome.map(|s| s.to_string()),
         severity,
         raw_message: raw.to_string(),
+        process_name: None,
+        command_line: None,
+        file_path: None,
+        file_operation: None,
         tags,
     }
 }
@@ -299,6 +323,10 @@ fn normalize_web_error(
         outcome: Some("FAILURE".to_string()),
         severity,
         raw_message: raw.to_string(),
+        process_name: None,
+        command_line: None,
+        file_path: None,
+        file_operation: None,
         tags: None,
     }
 }
@@ -346,6 +374,10 @@ fn normalize_firewall(
         outcome: outcome.map(|s| s.to_string()),
         severity,
         raw_message: raw.to_string(),
+        process_name: None,
+        command_line: None,
+        file_path: None,
+        file_operation: None,
         tags,
     }
 }
@@ -360,6 +392,9 @@ fn normalize_windows(
 ) -> NormalizedLog {
     let event_id = extract_xml_event_id(raw);
     let (taxonomy, action, default_severity) = classify_windows_event(&source_type, event_id);
+
+    let (process_name, command_line, file_path, file_operation) =
+        extract_windows_process_file(raw, event_id);
 
     NormalizedLog {
         collected_at,
@@ -376,7 +411,61 @@ fn normalize_windows(
         outcome: None,
         severity: default_severity,
         raw_message: raw.to_string(),
+        process_name,
+        command_line,
+        file_path,
+        file_operation,
         tags: event_id.map(|id| vec![format!("EventID={}", id)]),
+    }
+}
+
+/// Extract structured process / file fields from Windows Security XML events.
+///
+/// - 4688 (process creation): `NewProcessName` + `CommandLine`
+/// - 4663 (object access): `ProcessName` + `ObjectName` + access-mask operation
+fn extract_windows_process_file(
+    raw: &str,
+    event_id: Option<u32>,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    match event_id {
+        Some(4688) => (
+            extract_xml_data(raw, "NewProcessName"),
+            extract_xml_data(raw, "CommandLine"),
+            None,
+            None,
+        ),
+        Some(4663) => (
+            extract_xml_data(raw, "ProcessName"),
+            None,
+            extract_xml_data(raw, "ObjectName"),
+            extract_xml_data(raw, "AccessMask").and_then(|mask| access_mask_operation(&mask)),
+        ),
+        _ => (None, None, None, None),
+    }
+}
+
+/// Map a 4663 AccessMask hex value to a coarse file operation.
+fn access_mask_operation(mask: &str) -> Option<String> {
+    let hex = mask
+        .trim()
+        .trim_start_matches("0x")
+        .trim_start_matches("0X");
+    let value = u64::from_str_radix(hex, 16).ok()?;
+    // FILE_DELETE 0x10000, FILE_WRITE_DATA 0x2, FILE_APPEND_DATA 0x4,
+    // FILE_READ_DATA 0x1 / FILE_LIST_DIRECTORY 0x1
+    if value & 0x10000 != 0 {
+        Some("delete".to_string())
+    } else if value & 0x6 != 0 {
+        Some("write".to_string())
+    } else if value & 0x1 != 0 {
+        Some("read".to_string())
+    } else {
+        Some("access".to_string())
     }
 }
 
@@ -721,5 +810,42 @@ mod tests {
         assert_eq!(log.source_ip, "0.0.0.0");
         assert_eq!(log.action, "UNKNOWN");
         assert!(log.raw_message.contains("some random log line"));
+    }
+
+    #[test]
+    fn windows_4688_extracts_process_and_command_line() {
+        let xml = r#"<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event"><System><EventID>4688</EventID></System><EventData><Data Name="SubjectUserName">SYSTEM</Data><Data Name="NewProcessName">C:\Windows\System32\cmd.exe</Data><Data Name="CommandLine">cmd.exe /c whoami</Data></EventData></Event>"#;
+        let rec = make_record(SourceType::WindowsProcess, xml);
+        let log = normalize_record(&rec);
+        assert_eq!(
+            log.process_name.as_deref(),
+            Some("C:\\Windows\\System32\\cmd.exe")
+        );
+        assert_eq!(log.command_line.as_deref(), Some("cmd.exe /c whoami"));
+        assert_eq!(log.file_path, None);
+    }
+
+    #[test]
+    fn windows_4663_extracts_file_path_and_operation() {
+        let xml = r#"<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event"><System><EventID>4663</EventID></System><EventData><Data Name="ProcessName">C:\Windows\System32\notepad.exe</Data><Data Name="ObjectName">C:\Users\admin\secret.txt</Data><Data Name="AccessMask">0x10000</Data></EventData></Event>"#;
+        let rec = make_record(SourceType::WindowsFim, xml);
+        let log = normalize_record(&rec);
+        assert_eq!(
+            log.process_name.as_deref(),
+            Some("C:\\Windows\\System32\\notepad.exe")
+        );
+        assert_eq!(
+            log.file_path.as_deref(),
+            Some("C:\\Users\\admin\\secret.txt")
+        );
+        assert_eq!(log.file_operation.as_deref(), Some("delete"));
+    }
+
+    #[test]
+    fn access_mask_write_and_read() {
+        assert_eq!(access_mask_operation("0x2"), Some("write".into()));
+        assert_eq!(access_mask_operation("0x1"), Some("read".into()));
+        assert_eq!(access_mask_operation("0x10000"), Some("delete".into()));
+        assert_eq!(access_mask_operation("garbage"), None);
     }
 }
