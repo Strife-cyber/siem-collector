@@ -692,7 +692,13 @@ fn normalize_windows(
         user_security_id: extract_xml_sid(raw),
         event_taxonomy: taxonomy.to_string(),
         action: action.to_string(),
-        outcome: None,
+        // Logon outcome drives the backend's outcome filters (R008
+        // login-after-failures, R002 pass-the-hash); it was always None.
+        outcome: match event_id {
+            Some(4624) => Some("SUCCESS".to_string()),
+            Some(4625) => Some("FAILURE".to_string()),
+            _ => None,
+        },
         severity: default_severity,
         raw_message: raw.to_string(),
         process_name,
@@ -1134,6 +1140,19 @@ mod tests {
             Some("C:\\Users\\admin\\secret.txt")
         );
         assert_eq!(log.file_operation.as_deref(), Some("delete"));
+    }
+
+    #[test]
+    fn windows_4624_4625_set_logon_outcome() {
+        let ok_xml = r#"<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event"><System><EventID>4624</EventID></System><EventData><Data Name="TargetUserName">alice</Data></EventData></Event>"#;
+        let ok = normalize_record(&make_record(SourceType::WindowsSecurity, ok_xml));
+        assert_eq!(ok.action, "SUCCESSFUL_LOGIN");
+        assert_eq!(ok.outcome.as_deref(), Some("SUCCESS"));
+
+        let bad_xml = r#"<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event"><System><EventID>4625</EventID></System><EventData><Data Name="TargetUserName">alice</Data></EventData></Event>"#;
+        let bad = normalize_record(&make_record(SourceType::WindowsSecurity, bad_xml));
+        assert_eq!(bad.action, "FAILED_LOGIN");
+        assert_eq!(bad.outcome.as_deref(), Some("FAILURE"));
     }
 
     #[test]
